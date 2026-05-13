@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-second-opinion"
+version = "0.1.0"
+description = "Local MCP server that routes a user-supplied summary to an external LLM (Gemini, Grok, ChatGPT) for an independent second opinion."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "llm-second-opinion contributors" }]
+dependencies = [
+    "mcp>=1.2.0",
+    "openai>=2.36,<3",
+    "google-genai>=1.55,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+llm-second-opinion = "llm_second_opinion.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llm_second_opinion"]

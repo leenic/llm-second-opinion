@@ -1,0 +1,21 @@
+{
+  "providers": {
+    "openai": {
+      "api_key": "sk-REPLACE-ME",
+      "reasoning_effort": "medium",
+      "web_search": false
+    },
+    "gemini": {
+      "api_key": "AIza-REPLACE-ME",
+      "reasoning_effort": "medium",
+      "web_search": false
+    },
+    "grok": {
+      "api_key": "xai-REPLACE-ME",
+      "reasoning_effort": "medium",
+      "web_search": false
+    }
+  },
+  "timeout_seconds": 60,
+  "log_prompts": false
+}
