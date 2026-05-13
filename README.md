@@ -141,6 +141,8 @@ Edit `%APPDATA%\Claude\claude_desktop_config.json` and add the same `mcpServers`
 
 Then ask Claude something like: *"Use second_opinion with target_model=gemini to review the plan we just sketched."*
 
+For a user-facing walkthrough of how to drive the tool from a Claude conversation — example prompts, picking which model, reading the results — see [USAGE.md](USAGE.md).
+
 ## Tool reference
 
 ### `second_opinion`
