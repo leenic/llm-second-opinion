@@ -1,8 +1,20 @@
 """Gemini provider via Google's Interactions API (google-genai SDK >= 1.55).
 
-The Interactions API is the stateful counterpart to OpenAI's Responses API.
-We use it in single-turn mode — no server-side state is carried between calls,
-matching the v1 spec (no conversation history forwarded).
+The Interactions API is Google's stateful counterpart to OpenAI's Responses
+API. We use it in single-turn mode — no `previous_interaction_id`, no
+server-side state — matching the v1 spec.
+
+Request shape (from `client.aio.interactions.create`):
+- input: str (the user's message)
+- model: str
+- system_instruction: str  (top-level, NOT nested under config)
+- generation_config: {temperature, max_output_tokens, thinking_level, ...}
+- tools: list[{type, ...}]
+
+Response shape (`Interaction`):
+- status: "completed" | "failed" | "cancelled" | "incomplete" | "in_progress"
+- outputs: list[Content] where each text item has type=="text" and .text
+- usage: total_input_tokens / total_output_tokens / total_tokens / total_thought_tokens
 """
 
 from __future__ import annotations
@@ -26,15 +38,6 @@ from .base import (
 class GeminiProvider(Provider):
     name = "gemini"
 
-    # Map the common `reasoning_effort` string to a Gemini thinking_budget
-    # (in tokens). "minimal" disables thinking; higher tiers let it think longer.
-    EFFORT_TO_THINKING_BUDGET = {
-        "minimal": 0,
-        "low": 1024,
-        "medium": 4096,
-        "high": 16384,
-    }
-
     def __init__(
         self,
         api_key: str,
@@ -46,6 +49,8 @@ class GeminiProvider(Provider):
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        # `thinking_level` on the Interactions API takes exactly this enum,
+        # so we pass it through unchanged.
         self.reasoning_effort = reasoning_effort
         self.web_search = web_search
 
@@ -55,34 +60,36 @@ class GeminiProvider(Provider):
     def _client(self) -> genai.Client:
         return genai.Client(api_key=self.api_key)
 
-    def _build_config(self, req: SecondOpinionRequest) -> dict[str, Any]:
-        cfg: dict[str, Any] = {}
+    def _build_kwargs(self, req: SecondOpinionRequest) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "input": self.build_user_content(req),
+        }
         if req.system_prompt:
-            cfg["system_instruction"] = req.system_prompt
+            kwargs["system_instruction"] = req.system_prompt
+
+        gen_cfg: dict[str, Any] = {}
         if req.temperature is not None:
-            cfg["temperature"] = req.temperature
+            gen_cfg["temperature"] = req.temperature
         if req.max_tokens is not None:
-            cfg["max_output_tokens"] = req.max_tokens
+            gen_cfg["max_output_tokens"] = req.max_tokens
         if self.reasoning_effort:
-            budget = self.EFFORT_TO_THINKING_BUDGET.get(self.reasoning_effort)
-            if budget is not None:
-                cfg["thinking_config"] = {"thinking_budget": budget}
+            gen_cfg["thinking_level"] = self.reasoning_effort
+        if gen_cfg:
+            kwargs["generation_config"] = gen_cfg
+
         if self.web_search:
-            cfg["tools"] = [{"google_search": {}}]
-        return cfg
+            kwargs["tools"] = [{"type": "google_search"}]
+
+        return kwargs
 
     async def generate(self, req: SecondOpinionRequest) -> SecondOpinionResponse:
-        config = self._build_config(req)
+        kwargs = self._build_kwargs(req)
         client = self._client()
-        user_input = self.build_user_content(req)
 
         start = time.monotonic()
         try:
-            coro = client.aio.interactions.create(
-                model=self.model,
-                input=user_input,
-                config=config or None,
-            )
+            coro = client.aio.interactions.create(**kwargs)
             response = await asyncio.wait_for(coro, timeout=self.timeout)
         except asyncio.TimeoutError as e:
             raise ProviderError(
@@ -101,25 +108,30 @@ class GeminiProvider(Provider):
 
         latency_ms = int((time.monotonic() - start) * 1000)
 
-        # Block / safety detection.
-        blocked_reason = _detect_block(response)
-        if blocked_reason:
+        status = getattr(response, "status", None)
+        if status == "failed":
+            raise ProviderError(
+                "upstream_error",
+                f"gemini interaction failed (status={status})",
+                retriable=False,
+            )
+        if status in ("cancelled", "incomplete"):
             raise ProviderError(
                 "content_blocked",
-                f"gemini blocked the response: {blocked_reason}",
+                f"gemini interaction did not complete (status={status})",
                 retriable=False,
             )
 
-        text = (getattr(response, "text", None) or "").strip()
+        text = _join_output_text(response).strip()
         if not text:
-            text = _join_candidate_text(response)
+            raise ProviderError(
+                "upstream_error",
+                f"gemini returned no text output (status={status!r})",
+                retriable=False,
+            )
 
         usage = _extract_usage(response)
-        actual_model = (
-            getattr(response, "model_version", None)
-            or getattr(response, "model", None)
-            or self.model
-        )
+        actual_model = _extract_model_id(response, fallback=self.model)
 
         return SecondOpinionResponse(
             provider=self.name,
@@ -150,6 +162,10 @@ class GeminiProvider(Provider):
 
 def _translate_genai_error(e: genai_errors.APIError) -> ProviderError:
     status = getattr(e, "code", None) or getattr(e, "status_code", None) or 0
+    try:
+        status = int(status) if status else 0
+    except (TypeError, ValueError):
+        status = 0
     msg = getattr(e, "message", None) or str(e)
     if status in (401, 403):
         return ProviderError("auth_failed", f"gemini authentication failed: {msg}",
@@ -169,45 +185,32 @@ def _translate_genai_error(e: genai_errors.APIError) -> ProviderError:
     return ProviderError("upstream_error", f"gemini error: {msg}", retriable=False)
 
 
-def _detect_block(response: Any) -> str | None:
-    # Prompt-level block.
-    prompt_feedback = getattr(response, "prompt_feedback", None)
-    if prompt_feedback is not None:
-        block_reason = getattr(prompt_feedback, "block_reason", None)
-        if block_reason:
-            return f"prompt blocked: {block_reason}"
-    # Candidate-level block.
-    candidates = getattr(response, "candidates", None) or []
-    for c in candidates:
-        fr = getattr(c, "finish_reason", None)
-        if fr is None:
-            continue
-        # SDK exposes finish_reason as an enum; compare by name.
-        fr_name = getattr(fr, "name", None) or str(fr)
-        if fr_name in {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT"}:
-            return f"finish_reason={fr_name}"
-    return None
-
-
-def _join_candidate_text(response: Any) -> str:
+def _join_output_text(response: Any) -> str:
+    """Walk `response.outputs` and concatenate every text-type content block."""
     parts: list[str] = []
-    for cand in getattr(response, "candidates", None) or []:
-        content = getattr(cand, "content", None)
-        if content is None:
-            continue
-        for p in getattr(content, "parts", None) or []:
-            t = getattr(p, "text", None)
+    for item in getattr(response, "outputs", None) or []:
+        if getattr(item, "type", None) == "text":
+            t = getattr(item, "text", None)
             if t:
                 parts.append(t)
     return "".join(parts)
 
 
 def _extract_usage(response: Any) -> TokenUsage | None:
-    meta = getattr(response, "usage_metadata", None)
-    if meta is None:
+    usage = getattr(response, "usage", None)
+    if usage is None:
         return None
     return TokenUsage(
-        input_tokens=getattr(meta, "prompt_token_count", None),
-        output_tokens=getattr(meta, "candidates_token_count", None),
-        total_tokens=getattr(meta, "total_token_count", None),
+        input_tokens=getattr(usage, "total_input_tokens", None),
+        output_tokens=getattr(usage, "total_output_tokens", None),
+        total_tokens=getattr(usage, "total_tokens", None),
     )
+
+
+def _extract_model_id(response: Any, fallback: str) -> str:
+    m = getattr(response, "model", None)
+    if m is None:
+        return fallback
+    if isinstance(m, str):
+        return m
+    return getattr(m, "id", None) or getattr(m, "name", None) or str(m)

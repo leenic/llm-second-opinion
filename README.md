@@ -68,7 +68,7 @@ A provider with no key (or with the `REPLACE-ME` placeholder) is treated as unav
 | Provider | Where it goes |
 |---|---|
 | OpenAI / Grok | `reasoning={"effort": "<value>"}` on the Responses API call |
-| Gemini | Mapped to `thinking_config.thinking_budget`: `minimal`→0 (disables thinking), `low`→1024, `medium`→4096, `high`→16384 tokens |
+| Gemini | `generation_config.thinking_level = "<value>"` on the Interactions API call (Gemini accepts the same `minimal`/`low`/`medium`/`high` enum) |
 
 If omitted, the SDK's own default applies — for all three current flagships that means reasoning is **on** at a provider-chosen depth.
 
@@ -77,7 +77,7 @@ If omitted, the SDK's own default applies — for all three current flagships th
 | Provider | Tool sent |
 |---|---|
 | OpenAI | `tools=[{"type": "web_search"}]` |
-| Gemini | `config.tools=[{"google_search": {}}]` |
+| Gemini | `tools=[{"type": "google_search"}]` on the Interactions API call |
 | Grok | `tools=[{"type": "web_search"}]` via the OpenAI-compatible Responses layer. If xAI rejects this shape on your account, set `web_search: false` for `grok` and use Gemini or OpenAI for queries that need fresh facts |
 
 Enabling web search adds latency and may add cost depending on the provider's billing.
