@@ -16,6 +16,6 @@
       "web_search": false
     }
   },
-  "timeout_seconds": 60,
+  "timeout_seconds": 180,
   "log_prompts": false
 }

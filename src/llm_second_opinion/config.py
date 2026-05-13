@@ -20,7 +20,7 @@ DEFAULT_MODELS = {
     "grok": "grok-4.3",
 }
 
-DEFAULT_TIMEOUT_SECONDS = 60.0
+DEFAULT_TIMEOUT_SECONDS = 180.0
 
 REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
 

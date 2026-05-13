@@ -60,7 +60,7 @@ A provider with no key (or with the `REPLACE-ME` placeholder) is treated as unav
 | `providers.<name>.model` | Optional model name override for that provider |
 | `providers.<name>.reasoning_effort` | Optional. One of `minimal`, `low`, `medium`, `high`. Omit to use the provider's default thinking depth |
 | `providers.<name>.web_search` | Optional `true`/`false`. Attaches the provider's built-in web search tool to every call. Default `false` |
-| `timeout_seconds` | Per-request timeout to the upstream LLM (default 60) |
+| `timeout_seconds` | Per-request timeout to the upstream LLM (default 180). Reasoning-heavy flagships (gpt-5.5, gemini-3.1-pro, grok-4.3) often take 60–120s end-to-end via the Responses/Interactions APIs because there is no streaming. Lower this if you want failures to surface faster; raise it if you also enable `web_search` and see timeouts |
 | `log_prompts` | If `true`, prompts and responses are written to the log. Off by default |
 
 #### How `reasoning_effort` is applied per provider
