@@ -204,6 +204,7 @@ def _extract_usage(response: Any) -> TokenUsage | None:
         input_tokens=getattr(usage, "total_input_tokens", None),
         output_tokens=getattr(usage, "total_output_tokens", None),
         total_tokens=getattr(usage, "total_tokens", None),
+        reasoning_tokens=getattr(usage, "total_thought_tokens", None),
     )
 
 

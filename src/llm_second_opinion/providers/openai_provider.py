@@ -118,6 +118,38 @@ class ResponsesAPIProvider(Provider):
 
         latency_ms = int((time.monotonic() - start) * 1000)
 
+        usage = _extract_usage(response)
+        status = getattr(response, "status", None)
+        incomplete = getattr(response, "incomplete_details", None)
+        incomplete_reason = getattr(incomplete, "reason", None) if incomplete else None
+
+        if status == "failed":
+            err = getattr(response, "error", None)
+            err_msg = getattr(err, "message", None) if err else None
+            raise ProviderError(
+                "upstream_error",
+                f"{self.name} response failed: {err_msg or 'unknown error'}",
+                retriable=False,
+            )
+
+        if status == "incomplete":
+            reasoning_tokens = usage.reasoning_tokens if usage else None
+            if incomplete_reason == "content_filter":
+                raise ProviderError(
+                    "content_blocked",
+                    f"{self.name} response blocked by content filter",
+                    retriable=False,
+                )
+            # The common "reasoning consumed the whole output budget" case.
+            raise ProviderError(
+                "upstream_error",
+                f"{self.name} response was cut short (reason="
+                f"{incomplete_reason!r}, reasoning_tokens={reasoning_tokens}). "
+                f"Retry with a higher max_tokens, a lower reasoning_effort, "
+                f"or omit max_tokens entirely.",
+                retriable=True,
+            )
+
         text = (getattr(response, "output_text", None) or "").strip()
         if not text:
             refusal = _extract_refusal(response)
@@ -127,10 +159,25 @@ class ResponsesAPIProvider(Provider):
                     f"{self.name} refused the request: {refusal}",
                     retriable=False,
                 )
-            # Fall back to manually walking `output` if `output_text` is empty.
-            text = _join_output_text(response)
+            # `output_text` is the concatenation of message-type items only;
+            # if it's empty, try walking the full output list once more.
+            text = _join_output_text(response).strip()
 
-        usage = _extract_usage(response)
+        if not text:
+            # status was 'completed' but no visible text — usually means the
+            # model emitted only reasoning items, or every output got consumed
+            # by tool calls. Don't pretend this was a success.
+            reasoning_tokens = usage.reasoning_tokens if usage else None
+            output_count = len(getattr(response, "output", None) or [])
+            raise ProviderError(
+                "upstream_error",
+                f"{self.name} returned no visible text (status={status!r}, "
+                f"output_items={output_count}, reasoning_tokens={reasoning_tokens}). "
+                f"Retry with a lower reasoning_effort, a higher max_tokens, "
+                f"or rephrase so the model answers directly.",
+                retriable=True,
+            )
+
         actual_model = getattr(response, "model", None) or self.model
 
         return SecondOpinionResponse(
@@ -162,10 +209,15 @@ def _extract_usage(response: Any) -> TokenUsage | None:
     usage = getattr(response, "usage", None)
     if usage is None:
         return None
+    reasoning_tokens: int | None = None
+    details = getattr(usage, "output_tokens_details", None)
+    if details is not None:
+        reasoning_tokens = getattr(details, "reasoning_tokens", None)
     return TokenUsage(
         input_tokens=getattr(usage, "input_tokens", None),
         output_tokens=getattr(usage, "output_tokens", None),
         total_tokens=getattr(usage, "total_tokens", None),
+        reasoning_tokens=reasoning_tokens,
     )
 
 

@@ -36,12 +36,17 @@ class TokenUsage:
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    # Reasoning/thinking tokens — subset of output_tokens spent on internal
+    # reasoning that isn't visible in the final message. Helps explain
+    # "high output_tokens but empty/short reply" outcomes.
+    reasoning_tokens: int | None = None
 
     def to_dict(self) -> dict:
         return {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
         }
 
 
