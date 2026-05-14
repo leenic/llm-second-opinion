@@ -2,16 +2,19 @@
   "providers": {
     "openai": {
       "api_key": "sk-REPLACE-ME",
+      "model": "gpt-5.5",
       "reasoning_effort": "medium",
       "web_search": false
     },
     "gemini": {
       "api_key": "AIza-REPLACE-ME",
+      "model": "gemini-3.1-pro-preview",
       "reasoning_effort": "medium",
       "web_search": false
     },
     "grok": {
       "api_key": "xai-REPLACE-ME",
+      "model": "grok-4.3",
       "reasoning_effort": "medium",
       "web_search": false
     }
