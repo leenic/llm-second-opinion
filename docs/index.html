@@ -146,9 +146,10 @@
   .toolchip .tick { color: var(--accent-2); }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  .opinions { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; padding-left: 44px; }
+  .opinion-wrap { padding-left: 44px; }
   .op {
-    border: 1px solid var(--line); border-radius: 12px; background: var(--bg); padding: 13px 14px;
+    border: 1px solid var(--line); border-radius: 12px; background: var(--bg); padding: 13px 15px;
+    max-width: 760px;
     opacity: 0; transform: translateY(10px); transition: opacity .45s ease, transform .45s ease;
   }
   .op.show { opacity: 1; transform: none; }
@@ -209,10 +210,10 @@
   footer a { color: var(--muted); }
 
   @media (max-width: 860px) {
-    .grid.cols-2, .grid.cols-3, .opinions, .flow, .feat, .quick, .limits { grid-template-columns: 1fr; }
+    .grid.cols-2, .grid.cols-3, .flow, .feat, .quick, .limits { grid-template-columns: 1fr; }
     .flow .step::after { display: none; }
     .nav-links a:not(.btn) { display: none; }
-    .opinions { padding-left: 0; } .toolrow { padding-left: 0; }
+    .opinion-wrap { padding-left: 0; } .toolrow { padding-left: 0; }
   }
 </style>
 </head>
@@ -310,8 +311,9 @@
     <h2>“Which to-do apps are best for quick capture, right now?”</h2>
     <p class="sub">
       A perfect case for a second opinion: “best, right now” depends on current apps and features that shift faster
-      than any training cutoff. Watch Claude answer, then fan the question out to three other models with web search —
-      and reconcile what they each surface.
+      than any training cutoff. You stay in the driver's seat — after Claude's first take, you ask for one external
+      opinion at a time (“get a second opinion from Gemini”, “have ChatGPT suggest what's missing”, “get Grok to
+      cross-check”). Each request fires a single MCP call, and Claude folds the reply into a revised recommendation.
     </p>
 
     <div class="demo-shell" id="demoShell">
@@ -505,18 +507,27 @@ notepad config.json   <span class="c"># add the keys you have</span></pre>
   // ---- Demo script: each entry is a timed step in the replay ----
   var feed = document.getElementById('demoFeed');
 
+  // The real workflow is user-driven and sequential: you ask for one model at
+  // a time, each request fires a single second_opinion MCP call, and Claude
+  // revises its recommendation after each reply.
   var STEPS = [
     { t: 'user', text: "What are the best to-do apps right now if I optimise purely for <b>quick capture</b> — getting a task in with the least friction? I want current options, not 2023's." },
-    { t: 'claude', text: "Off the top of my head: <b>Todoist</b> (natural-language quick add), <b>Things 3</b> (Quick Entry), <b>Apple Reminders</b> (Siri / lock screen) and <b>Drafts</b> (opens straight to a blank line). But “best right now” turns on current features and pricing that move fast — let me get a second opinion from models that can search the web, then reconcile." },
-    { t: 'tools' },
-    { t: 'opinions' },
-    { t: 'claude', text: "Reconciling the three: they <b>agree</b> the friction lives in the <i>capture trigger</i> more than the app — so <b>Drafts</b>, <b>Apple Reminders</b> and <b>Todoist</b> top everyone's list. They <b>differ</b> on platform: ChatGPT leans Apple-native, Gemini pushes cross-platform + voice, Grok argues the app barely matters next to a global hotkey. Two of them flagged a current detail my training lagged on. My take: on Apple, <b>Drafts + Reminders</b>; cross-platform, <b>Todoist or TickTick</b>. Want me to compare just those two?" }
-  ];
+    { t: 'claude', text: "For pure capture speed I'd start with: <b>Todoist</b> (natural-language quick add), <b>Things 3</b> (Quick Entry), <b>Apple Reminders</b> (Siri / lock screen), and <b>Drafts</b> (launches straight to a blank line). “Best right now” turns on current features and pricing, though — want me to pull in another model to pressure-test it?" },
 
-  var OPINIONS = [
-    { cls: 'gpt', name: 'ChatGPT · gpt-5.5', tag: 'web_search', html: "Optimising for capture friction, <b>Drafts</b> wins on Apple — launch lands on an empty line, then route it anywhere. Pair with <b>Apple Reminders</b> for Siri and lock-screen capture. <b>Todoist</b>'s natural-language quick-add is the best cross-platform option. Skip heavyweight project tools here." },
-    { cls: 'gemini', name: 'Gemini · 3.1 Pro', tag: 'google_search', html: "If you're not all-Apple, weight <b>voice + widgets</b>: <b>Google Keep</b> and <b>Todoist</b> have the fastest Android capture, and <b>TickTick</b>'s home-screen quick-ball is excellent. Things 3 and Drafts are iOS-only — a real constraint if you switch devices." },
-    { cls: 'grok', name: 'Grok · 4.3', tag: 'web_search', html: "Contrarian take: the <b>app barely matters</b> — the capture <i>trigger</i> does. Whatever you pick, bind a global hotkey / Siri / a single widget. <b>Drafts</b> and <b>Todoist</b> are right, but watch sync friction; a fast app you can't trust to sync is worse than a plain note that does." }
+    { t: 'user', text: "Get a second opinion from Gemini." },
+    { t: 'tool', model: 'gemini' },
+    { t: 'opinion', cls: 'gemini', name: 'Gemini · 3.1 Pro', tag: 'web_search', html: "Weight <b>cross-platform + voice</b>: <b>Google Keep</b> and <b>Todoist</b> have the fastest Android capture, and <b>TickTick</b>'s home-screen quick-ball is excellent. Note that Things 3 and Drafts are <b>iOS / Mac-only</b> — a real constraint if you ever switch devices." },
+    { t: 'claude', text: "Gemini flags that my list skewed Apple-only. <b>Revised:</b> if you're cross-platform, lead with <b>Todoist</b>, <b>TickTick</b>, or <b>Google Keep</b> (voice + widget capture); keep <b>Drafts</b> and <b>Things 3</b> only if you're all-Apple." },
+
+    { t: 'user', text: "Have ChatGPT suggest any that are missing." },
+    { t: 'tool', model: 'chatgpt' },
+    { t: 'opinion', cls: 'gpt', name: 'ChatGPT · gpt-5.5', tag: 'web_search', html: "Two gaps: <b>Apple Reminders</b> deserves top billing for Apple users — lock-screen + “Hey Siri, remind me…” is zero-friction. And <b>Microsoft To Do</b> is the natural pick inside a Microsoft 365 / Windows workflow. For text-first users, <b>Drafts</b> plus a share-sheet shortcut is still the fastest path." },
+    { t: 'claude', text: "Folding those in: <b>Apple Reminders</b> moves back near the top for Apple users, and <b>Microsoft To Do</b> covers Windows / 365. Working list is now Todoist, TickTick, Google Keep, Apple Reminders, Microsoft To Do, and Drafts — grouped by ecosystem." },
+
+    { t: 'user', text: "Get Grok to cross-check the list." },
+    { t: 'tool', model: 'grok' },
+    { t: 'opinion', cls: 'grok', name: 'Grok · 4.3', tag: 'web_search', html: "No bad picks, but you're tuning the wrong layer: the <b>capture trigger beats the app</b>. Whatever you choose, bind a global hotkey / Siri / a single home-screen widget — that's where friction actually lives. One caution: a fast app you can't trust to sync is worse than a plain note that does, so weight <b>sync reliability</b> too." },
+    { t: 'claude', text: "Grok cross-checks clean — same picks, sharper framing. <b>Final take:</b> choose by ecosystem (<b>Apple Reminders</b> / <b>Drafts</b> on Apple; <b>Todoist</b> / <b>TickTick</b> / <b>Google Keep</b> cross-platform; <b>Microsoft To Do</b> on Windows), then invest in the <b>capture trigger</b> — hotkey, Siri, or one widget — and confirm sync is rock-solid. That ordering matters more than the specific app." }
   ];
 
   var timers = [];
@@ -539,39 +550,32 @@ notepad config.json   <span class="c"># add the keys you have</span></pre>
       requestAnimationFrame(function(){ node.classList.add('show'); });
       timers.push(setTimeout(done, 60));
     }
-    else if (step.t === 'tools') {
+    else if (step.t === 'tool') {
+      // A single second_opinion MCP call to one provider.
       var row = el('<div class="toolrow"></div>');
-      ['chatgpt','gemini','grok'].forEach(function(m){
-        row.appendChild(el('<span class="toolchip"><span class="spin"></span>second_opinion · target=' + m + '</span>'));
-      });
+      var chip = el('<span class="toolchip"><span class="spin"></span>second_opinion · target=' + step.model + ' · web_search</span>');
+      row.appendChild(chip);
       feed.appendChild(row);
       requestAnimationFrame(function(){ row.classList.add('show'); });
-      // flip each chip to "done" with a tick, staggered
-      var chips = row.querySelectorAll('.toolchip');
-      chips.forEach(function(chip, i){
-        timers.push(setTimeout(function(){
-          chip.classList.add('done');
-          chip.querySelector('.spin').outerHTML = '<span class="tick">✓</span>';
-        }, 500 + i * 350));
-      });
-      timers.push(setTimeout(done, 500 + chips.length * 350));
+      timers.push(setTimeout(function(){
+        chip.classList.add('done');
+        chip.querySelector('.spin').outerHTML = '<span class="tick">✓</span>';
+      }, 950));
+      timers.push(setTimeout(done, 1200));
     }
-    else if (step.t === 'opinions') {
-      var grid = el('<div class="opinions"></div>');
-      OPINIONS.forEach(function(o){
-        grid.appendChild(el(
-          '<div class="op ' + o.cls + '">' +
-            '<div class="op-head"><span class="swatch"></span>' + o.name + '<span class="tag">' + o.tag + '</span></div>' +
-            '<p>' + o.html + '</p>' +
-          '</div>'
-        ));
-      });
-      feed.appendChild(grid);
-      var cards = grid.querySelectorAll('.op');
-      cards.forEach(function(card, i){
-        timers.push(setTimeout(function(){ card.classList.add('show'); }, 120 + i * 420));
-      });
-      timers.push(setTimeout(done, 120 + cards.length * 420 + 200));
+    else if (step.t === 'opinion') {
+      // The one provider's returned reply.
+      var wrap = el('<div class="opinion-wrap"></div>');
+      var card = el(
+        '<div class="op ' + step.cls + '">' +
+          '<div class="op-head"><span class="swatch"></span>' + step.name + '<span class="tag">' + step.tag + '</span></div>' +
+          '<p>' + step.html + '</p>' +
+        '</div>'
+      );
+      wrap.appendChild(card);
+      feed.appendChild(wrap);
+      requestAnimationFrame(function(){ card.classList.add('show'); });
+      timers.push(setTimeout(done, 220));
     }
   }
 
@@ -583,7 +587,7 @@ notepad config.json   <span class="c"># add the keys you have</span></pre>
       if (i >= STEPS.length) return;
       var step = STEPS[i++];
       // pacing: reading time before the next step appears
-      var pause = step.t === 'user' ? 700 : step.t === 'tools' ? 350 : step.t === 'opinions' ? 500 : 1500;
+      var pause = step.t === 'user' ? 900 : step.t === 'tool' ? 350 : step.t === 'opinion' ? 1700 : 2000;
       renderStep(step, function(){ timers.push(setTimeout(next, pause)); });
     }
     next();
