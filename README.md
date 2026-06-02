@@ -1,5 +1,7 @@
 # llm-second-opinion
 
+**📖 [Introduction &amp; live demo →](https://leenic.github.io/llm-second-opinion/)** — what it is, why it exists, and an animated walkthrough.
+
 A local MCP server that exposes a `second_opinion` tool. When Claude calls it, the server forwards a user-supplied summary to an external LLM (Gemini, Grok, or ChatGPT) and returns that model's independent, critical reply. Designed for single-developer use over stdio.
 
 ## What it does

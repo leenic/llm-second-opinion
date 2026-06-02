@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>llm-second-opinion — a second opinion for Claude, from ChatGPT, Gemini &amp; Grok</title>
+<meta name="description" content="A local MCP server that lets Claude ask ChatGPT, Gemini, or Grok for an independent second opinion — closing the gap on information Claude can't see and surfacing differing perspectives for consideration." />
+<style>
+  :root {
+    --bg: #0d1017;
+    --bg-soft: #141925;
+    --panel: #181e2c;
+    --panel-2: #1f2738;
+    --line: #2a3346;
+    --text: #e8ecf4;
+    --muted: #97a3b8;
+    --faint: #6b7689;
+    --accent: #7c8cff;
+    --accent-2: #57e6c4;
+    --accent-3: #ff9d6c;
+    --grok: #c9a3ff;
+    --gpt: #57e6c4;
+    --gemini: #7cc4ff;
+    --radius: 14px;
+    --maxw: 1040px;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 22px; }
+  h1, h2, h3 { line-height: 1.2; letter-spacing: -0.02em; }
+
+  /* ---- top nav ---- */
+  header.nav {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: blur(10px);
+    background: rgba(13,16,23,0.72);
+    border-bottom: 1px solid var(--line);
+  }
+  .nav-inner { display: flex; align-items: center; gap: 18px; height: 58px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 650; }
+  .brand .logo { width: 26px; height: 26px; }
+  .nav-links { margin-left: auto; display: flex; gap: 22px; align-items: center; font-size: 14px; }
+  .nav-links a { color: var(--muted); }
+  .nav-links a:hover { color: var(--text); text-decoration: none; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 9px 16px; border-radius: 10px; font-weight: 600; font-size: 14px;
+    border: 1px solid var(--line); color: var(--text); background: var(--panel-2);
+    transition: transform .08s ease, border-color .2s ease, background .2s ease;
+  }
+  .btn:hover { text-decoration: none; border-color: var(--accent); transform: translateY(-1px); }
+  .btn.primary { background: linear-gradient(135deg, var(--accent), #5d6bff); border-color: transparent; color: #0b0e16; }
+  .btn.primary:hover { filter: brightness(1.06); }
+
+  /* ---- hero ---- */
+  .hero { position: relative; padding: 78px 0 56px; overflow: hidden; }
+  .hero::before {
+    content: ""; position: absolute; inset: -40% 0 auto 0; height: 520px;
+    background: radial-gradient(60% 60% at 30% 20%, rgba(124,140,255,0.20), transparent 70%),
+                radial-gradient(50% 50% at 80% 0%, rgba(87,230,196,0.14), transparent 70%);
+    pointer-events: none;
+  }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 12.5px; color: var(--accent-2); background: rgba(87,230,196,0.08);
+    border: 1px solid rgba(87,230,196,0.25); padding: 5px 12px; border-radius: 999px;
+    letter-spacing: .02em;
+  }
+  .hero h1 { font-size: clamp(34px, 5.4vw, 58px); margin: 20px 0 14px; font-weight: 760; }
+  .hero h1 .grad {
+    background: linear-gradient(120deg, var(--accent), var(--accent-2) 55%, var(--accent-3));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .hero p.lead { font-size: clamp(17px, 2.2vw, 21px); color: var(--muted); max-width: 720px; margin: 0 0 30px; }
+  .hero-cta { display: flex; gap: 12px; flex-wrap: wrap; }
+  .hero-meta { margin-top: 26px; display: flex; gap: 22px; flex-wrap: wrap; color: var(--faint); font-size: 13.5px; }
+  .hero-meta b { color: var(--text); font-weight: 600; }
+
+  /* ---- sections ---- */
+  section { padding: 60px 0; border-top: 1px solid var(--line); }
+  .eyebrow { color: var(--accent); font-size: 13px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+  section h2 { font-size: clamp(26px, 3.6vw, 36px); margin: 10px 0 16px; }
+  section .sub { color: var(--muted); max-width: 760px; font-size: 17px; margin-bottom: 36px; }
+
+  /* ---- why grid ---- */
+  .grid { display: grid; gap: 18px; }
+  .grid.cols-2 { grid-template-columns: repeat(2, 1fr); }
+  .grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+  .card {
+    background: linear-gradient(180deg, var(--panel), var(--bg-soft));
+    border: 1px solid var(--line); border-radius: var(--radius); padding: 24px;
+  }
+  .card h3 { font-size: 18px; margin: 14px 0 8px; }
+  .card p { color: var(--muted); font-size: 15px; margin: 0; }
+  .ic { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 9px;
+        background: rgba(124,140,255,0.12); border: 1px solid rgba(124,140,255,0.25); }
+  .ic svg { width: 19px; height: 19px; stroke: var(--accent); }
+
+  /* ---- demo ---- */
+  .demo-shell {
+    background: var(--bg-soft); border: 1px solid var(--line); border-radius: 16px;
+    overflow: hidden; box-shadow: 0 24px 60px -30px rgba(0,0,0,0.8);
+  }
+  .demo-bar { display: flex; align-items: center; gap: 8px; padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  .dot { width: 11px; height: 11px; border-radius: 50%; }
+  .dot.r { background: #ff5f57; } .dot.y { background: #febc2e; } .dot.g { background: #28c840; }
+  .demo-title { margin-left: 10px; font-size: 13px; color: var(--muted); font-family: var(--mono); }
+  .demo-replay { margin-left: auto; }
+  .replay-btn {
+    font-size: 12.5px; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+    padding: 6px 12px; border-radius: 8px; cursor: pointer; display: inline-flex; align-items: center; gap: 7px;
+  }
+  .replay-btn:hover { border-color: var(--accent); }
+  .replay-btn svg { width: 14px; height: 14px; stroke: var(--accent); }
+  .demo-feed { padding: 22px; min-height: 360px; display: flex; flex-direction: column; gap: 16px; }
+
+  .msg { display: flex; gap: 12px; opacity: 0; transform: translateY(8px); transition: opacity .4s ease, transform .4s ease; }
+  .msg.show { opacity: 1; transform: none; }
+  .avatar { flex: 0 0 32px; height: 32px; border-radius: 8px; display: grid; place-items: center; font-size: 13px; font-weight: 700; }
+  .av-user { background: #2a3346; color: var(--text); }
+  .av-claude { background: linear-gradient(135deg,#d97757,#c2410c); color: #fff; }
+  .bubble { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 15px; font-size: 14.5px; max-width: 760px; }
+  .who { font-size: 11.5px; color: var(--faint); margin-bottom: 4px; font-weight: 600; letter-spacing: .03em; }
+  .bubble.user { background: var(--panel-2); }
+
+  .toolrow { display: flex; flex-wrap: wrap; gap: 8px; padding-left: 44px; opacity: 0; transform: translateY(8px); transition: opacity .4s ease, transform .4s ease; }
+  .toolrow.show { opacity: 1; transform: none; }
+  .toolchip {
+    font-family: var(--mono); font-size: 12px; padding: 6px 11px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--muted); display: inline-flex; gap: 7px; align-items: center;
+  }
+  .toolchip .spin { width: 11px; height: 11px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+  .toolchip.done .spin { border: none; }
+  .toolchip .tick { color: var(--accent-2); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .opinions { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; padding-left: 44px; }
+  .op {
+    border: 1px solid var(--line); border-radius: 12px; background: var(--bg); padding: 13px 14px;
+    opacity: 0; transform: translateY(10px); transition: opacity .45s ease, transform .45s ease;
+  }
+  .op.show { opacity: 1; transform: none; }
+  .op-head { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 13.5px; margin-bottom: 8px; }
+  .op-head .tag { margin-left: auto; font-size: 10.5px; font-weight: 600; color: var(--faint); border: 1px solid var(--line); padding: 2px 7px; border-radius: 6px; font-family: var(--mono); }
+  .op .swatch { width: 9px; height: 9px; border-radius: 50%; }
+  .op.gpt .swatch { background: var(--gpt); } .op.gpt .op-head { color: var(--gpt); }
+  .op.gemini .swatch { background: var(--gemini); } .op.gemini .op-head { color: var(--gemini); }
+  .op.grok .swatch { background: var(--grok); } .op.grok .op-head { color: var(--grok); }
+  .op p { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.5; }
+  .op p b { color: var(--text); font-weight: 600; }
+  .demo-caption { color: var(--faint); font-size: 13px; margin-top: 14px; text-align: center; }
+
+  /* ---- how it works ---- */
+  .flow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; align-items: stretch; }
+  .flow .step { position: relative; padding: 20px 18px; }
+  .flow .step:not(:last-child)::after {
+    content: "→"; position: absolute; right: -10px; top: 26px; color: var(--faint); font-size: 18px;
+  }
+  .flow .n { width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center; background: var(--panel-2); border: 1px solid var(--line); color: var(--accent); font-weight: 700; font-size: 14px; margin-bottom: 12px; }
+  .flow h4 { margin: 0 0 6px; font-size: 15px; }
+  .flow p { margin: 0; color: var(--muted); font-size: 13.5px; }
+
+  /* ---- providers table ---- */
+  .tbl { width: 100%; border-collapse: collapse; font-size: 14.5px; overflow: hidden; border-radius: 12px; border: 1px solid var(--line); }
+  .tbl th, .tbl td { text-align: left; padding: 13px 16px; border-bottom: 1px solid var(--line); }
+  .tbl th { background: var(--panel); color: var(--muted); font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; }
+  .tbl tr:last-child td { border-bottom: none; }
+  .tbl td code, .tbl th code { font-family: var(--mono); font-size: 13px; color: var(--accent-2); }
+  .tbl .pname { font-weight: 650; color: var(--text); }
+
+  /* ---- feature list ---- */
+  .feat { display: grid; grid-template-columns: repeat(2,1fr); gap: 14px 26px; }
+  .feat .row { display: flex; gap: 12px; }
+  .feat .row svg { flex: 0 0 18px; width: 18px; height: 18px; stroke: var(--accent-2); margin-top: 3px; }
+  .feat .row b { display: block; font-size: 15px; }
+  .feat .row span { color: var(--muted); font-size: 14px; }
+
+  /* ---- code blocks ---- */
+  pre {
+    background: #0a0d14; border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px;
+    overflow-x: auto; font-family: var(--mono); font-size: 13px; color: #cdd6e6; line-height: 1.6;
+  }
+  pre .c { color: var(--faint); } pre .k { color: var(--accent); } pre .s { color: var(--accent-2); }
+  .quick { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .quick h4 { margin: 0 0 10px; font-size: 14px; color: var(--muted); }
+
+  blockquote {
+    margin: 0; padding: 16px 20px; border-left: 3px solid var(--accent); background: var(--panel);
+    border-radius: 0 12px 12px 0; color: var(--muted); font-size: 14.5px; font-style: italic;
+  }
+
+  .limits { display: grid; grid-template-columns: repeat(2,1fr); gap: 10px 26px; color: var(--muted); font-size: 14.5px; }
+  .limits div { display: flex; gap: 10px; } .limits div::before { content: "—"; color: var(--faint); }
+
+  footer { border-top: 1px solid var(--line); padding: 40px 0 60px; color: var(--faint); font-size: 14px; }
+  footer .frow { display: flex; flex-wrap: wrap; gap: 18px; align-items: center; }
+  footer a { color: var(--muted); }
+
+  @media (max-width: 860px) {
+    .grid.cols-2, .grid.cols-3, .opinions, .flow, .feat, .quick, .limits { grid-template-columns: 1fr; }
+    .flow .step::after { display: none; }
+    .nav-links a:not(.btn) { display: none; }
+    .opinions { padding-left: 0; } .toolrow { padding-left: 0; }
+  }
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 32 32" fill="none">
+        <rect x="2" y="5" width="20" height="14" rx="4" fill="#7c8cff"/>
+        <rect x="10" y="13" width="20" height="14" rx="4" fill="#57e6c4"/>
+        <circle cx="9" cy="12" r="1.6" fill="#0d1017"/><circle cx="15" cy="12" r="1.6" fill="#0d1017"/>
+        <circle cx="20" cy="20" r="1.6" fill="#0d1017"/><circle cx="26" cy="20" r="1.6" fill="#0d1017"/>
+      </svg>
+      <span>llm-second-opinion</span>
+    </div>
+    <nav class="nav-links">
+      <a href="#why">Why</a>
+      <a href="#demo">Demo</a>
+      <a href="#how">How it works</a>
+      <a href="#capabilities">Capabilities</a>
+      <a href="#quickstart">Quickstart</a>
+      <a class="btn" href="https://github.com/leenic/llm-second-opinion" target="_blank" rel="noopener">GitHub ↗</a>
+    </nav>
+  </div>
+</header>
+
+<!-- ============ HERO ============ -->
+<div class="hero">
+  <div class="wrap">
+    <span class="pill">● Local MCP server · stdio · single-developer</span>
+    <h1>Give Claude a <span class="grad">second opinion</span>.</h1>
+    <p class="lead">
+      A local <b>Model Context Protocol</b> server that lets Claude step out of its own head — forwarding a
+      summary to <b>ChatGPT</b>, <b>Gemini</b>, or <b>Grok</b> and bringing back an independent, critical reply.
+      It closes the gap on information that exists in the world but isn't available to Claude, and surfaces
+      genuinely <b>different perspectives for consideration</b>.
+    </p>
+    <div class="hero-cta">
+      <a class="btn primary" href="#demo">▶ Watch the demo</a>
+      <a class="btn" href="https://github.com/leenic/llm-second-opinion" target="_blank" rel="noopener">View on GitHub</a>
+      <a class="btn" href="#quickstart">Quickstart</a>
+    </div>
+    <div class="hero-meta">
+      <span><b>2</b> tools — <code style="font-family:var(--mono)">second_opinion</code>, <code style="font-family:var(--mono)">list_available_models</code></span>
+      <span><b>3</b> external models, each with optional web search</span>
+      <span><b>0</b> conversation data stored — single-turn, nothing persisted</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============ WHY ============ -->
+<section id="why">
+  <div class="wrap">
+    <span class="eyebrow">The purpose</span>
+    <h2>Every model has blind spots. This is how Claude checks its own.</h2>
+    <p class="sub">
+      A single model answers from one training run and, at best, one web-search habit. That leaves real gaps —
+      information that exists, but that this model can't see or didn't think to look for. A second opinion from a
+      different vendor closes that gap.
+    </p>
+    <div class="grid cols-2">
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="9"/></svg></div>
+        <h3>Counter stale knowledge</h3>
+        <p>An LLM often needs updated information but hasn't sought it — answering confidently from a training cutoff. A second model (especially with web search on) catches what's gone out of date since.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 12h18M12 3v18"/><circle cx="12" cy="12" r="9"/></svg></div>
+        <h3>Close the information gap</h3>
+        <p>The goal is to reach information that exists in the world but may not be available to Claude — whether it's behind a different model's training data or a different search index.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></div>
+        <h3>Different training data</h3>
+        <p>ChatGPT, Gemini, and Grok were each trained on different corpora. Where one is thin, another may be rich — so asking across vendors widens what's actually known.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></div>
+        <h3>Different web search, varying results</h3>
+        <p>Each provider's built-in search hits the live web differently and returns varying information. Comparing them turns one search into several independent ones.</p>
+      </div>
+    </div>
+    <blockquote style="margin-top:24px;">
+      The objective isn't to outvote Claude — it's to put differing, independent perspectives on the table so
+      <i>you</i> can weigh them. Claude stays the driver; the second opinion is just another well-informed voice.
+    </blockquote>
+  </div>
+</section>
+
+<!-- ============ DEMO ============ -->
+<section id="demo">
+  <div class="wrap">
+    <span class="eyebrow">See it in action</span>
+    <h2>“Which to-do apps are best for quick capture, right now?”</h2>
+    <p class="sub">
+      A perfect case for a second opinion: “best, right now” depends on current apps and features that shift faster
+      than any training cutoff. Watch Claude answer, then fan the question out to three other models with web search —
+      and reconcile what they each surface.
+    </p>
+
+    <div class="demo-shell" id="demoShell">
+      <div class="demo-bar">
+        <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+        <span class="demo-title">Claude · llm-second-opinion</span>
+        <div class="demo-replay">
+          <button class="replay-btn" id="replayBtn">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke="currentColor"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+            Replay
+          </button>
+        </div>
+      </div>
+      <div class="demo-feed" id="demoFeed">
+        <!-- messages injected by JS -->
+      </div>
+    </div>
+    <p class="demo-caption">An in-page re-enactment of a real session. Model replies are illustrative — the point is the pattern, not the exact wording.</p>
+  </div>
+</section>
+
+<!-- ============ HOW IT WORKS ============ -->
+<section id="how">
+  <div class="wrap">
+    <span class="eyebrow">How it works</span>
+    <h2>An MCP tool call, four steps deep</h2>
+    <p class="sub">The server speaks MCP over stdio. Claude calls a tool; the server forwards your summary to one external model in a single, stateless turn and returns the reply as structured JSON.</p>
+    <div class="card" style="padding:8px;">
+      <div class="flow">
+        <div class="step"><div class="n">1</div><h4>You ask Claude</h4><p>“Get a second opinion from Gemini on this plan.” Claude writes a self-contained summary of the context.</p></div>
+        <div class="step"><div class="n">2</div><h4>Claude calls the tool</h4><p><code style="font-family:var(--mono);color:var(--accent-2)">second_opinion</code> with a <code style="font-family:var(--mono);color:var(--accent-2)">target_model</code> and optional focus, system prompt, temperature, max&nbsp;tokens.</p></div>
+        <div class="step"><div class="n">3</div><h4>Server forwards it</h4><p>Single-turn call to that vendor's API — with the configured reasoning effort and web search. No chat history leaves your machine.</p></div>
+        <div class="step"><div class="n">4</div><h4>Reply comes back</h4><p>Structured JSON: the model's text, the real model id, token usage, and latency — or a clean, typed error.</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CAPABILITIES ============ -->
+<section id="capabilities">
+  <div class="wrap">
+    <span class="eyebrow">Capabilities</span>
+    <h2>Three flagships, one consistent interface</h2>
+    <p class="sub">Each provider is called through its current recommended interface, in single-turn mode. Defaults track each vendor's flagship and can be overridden per provider.</p>
+
+    <table class="tbl">
+      <thead>
+        <tr><th>Target</th><th>Provider &amp; interface</th><th>Default model</th><th>SDK</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="pname">chatgpt</td><td>OpenAI — Responses API</td><td><code>gpt-5.5</code></td><td><code>openai ≥ 2.36</code></td></tr>
+        <tr><td class="pname">gemini</td><td>Google — Interactions API</td><td><code>gemini-3.1-pro-preview</code></td><td><code>google-genai ≥ 1.55</code></td></tr>
+        <tr><td class="pname">grok</td><td>xAI — OpenAI-compatible Responses API</td><td><code>grok-4.3</code></td><td><code>openai ≥ 2.36</code></td></tr>
+      </tbody>
+    </table>
+
+    <div class="grid cols-2" style="margin-top:34px;">
+      <div class="card">
+        <h3 style="margin-top:0;">Shape each call</h3>
+        <div class="feat" style="grid-template-columns:1fr;">
+          <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>focus</b>Narrow the reviewer's attention to one aspect.</span></div>
+          <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>system_prompt</b>Replace the default reviewer persona for a different kind of feedback.</span></div>
+          <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>temperature</b>Pass through a sampling temperature when the model honours it.</span></div>
+          <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>max_tokens</b>Cap the reply length for a quick verdict.</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0;">Set once per provider</h3>
+        <div class="feat" style="grid-template-columns:1fr;">
+          <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>reasoning_effort</b><code style="font-family:var(--mono);color:var(--accent-2)">minimal · low · medium · high</code> — how hard the model thinks before answering.</span></div>
+          <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>web_search</b>Attach the provider's built-in search tool — the key to fresh facts.</span></div>
+          <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>model override</b>Point any target at a different model name, no code change.</span></div>
+          <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>timeout_seconds</b>Per-request wall-clock bound (retries off, so it's exact).</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid cols-3" style="margin-top:18px;">
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></div>
+        <h3>Reachability checks</h3>
+        <p><code style="font-family:var(--mono);color:var(--accent-2)">list_available_models</code> reports which providers have a key and pass a low-cost probe — so Claude can tell you what's usable up front.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></div>
+        <h3>Graceful, typed errors</h3>
+        <p>Failures never crash the call — you get <code style="font-family:var(--mono);color:var(--accent-2)">success:false</code> with a type like <code style="font-family:var(--mono)">auth_failed</code>, <code style="font-family:var(--mono)">rate_limit</code>, <code style="font-family:var(--mono)">timeout</code>, or <code style="font-family:var(--mono)">content_blocked</code>.</p>
+      </div>
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+        <h3>Keys stay local</h3>
+        <p>API keys live only in a git-ignored <code style="font-family:var(--mono)">config.json</code> (or env vars). Nothing is logged by default; no conversation history is forwarded.</p>
+      </div>
+    </div>
+
+    <div style="margin-top:30px;">
+      <h3 style="font-size:18px;margin-bottom:10px;">The default reviewer persona</h3>
+      <blockquote>
+        You are acting as an external reviewer for a conversation the user is having with another AI assistant…
+        Be direct, concrete, and critical. If you disagree with the framing or see a stronger alternative, say so
+        explicitly. Do not pad with praise. State your confidence level when making factual claims.
+      </blockquote>
+    </div>
+  </div>
+</section>
+
+<!-- ============ QUICKSTART ============ -->
+<section id="quickstart">
+  <div class="wrap">
+    <span class="eyebrow">Quickstart</span>
+    <h2>Up and running in a few minutes</h2>
+    <p class="sub">Requires Python 3.10+. Bring your own API key for any provider you want to use — a provider with no key is simply skipped.</p>
+
+    <div class="quick">
+      <div>
+        <h4>1 · Install</h4>
+<pre><span class="c"># from the project root</span>
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e .</pre>
+        <h4 style="margin-top:18px;">2 · Configure</h4>
+<pre>copy config.example.json config.json
+notepad config.json   <span class="c"># add the keys you have</span></pre>
+      </div>
+      <div>
+        <h4>3 · Register with Claude</h4>
+<pre><span class="c">// MCP config (Claude Code / Desktop)</span>
+{
+  <span class="s">"mcpServers"</span>: {
+    <span class="s">"llm-second-opinion"</span>: {
+      <span class="s">"command"</span>: <span class="s">"llm-second-opinion"</span>,
+      <span class="s">"env"</span>: {
+        <span class="s">"LLM_SECOND_OPINION_CONFIG"</span>:
+          <span class="s">"C:\\src\\...\\config.json"</span>
+      }
+    }
+  }
+}</pre>
+        <h4 style="margin-top:18px;">4 · Ask Claude</h4>
+<pre><span class="c"># in any Claude conversation</span>
+"Get a second opinion from Gemini
+ on the plan we just sketched —
+ turn on web search."</pre>
+      </div>
+    </div>
+    <p style="margin-top:22px;color:var(--muted);">
+      Full configuration reference, environment-variable overrides, and a usage walkthrough live in the
+      <a href="https://github.com/leenic/llm-second-opinion#readme" target="_blank" rel="noopener">README</a>
+      and <a href="https://github.com/leenic/llm-second-opinion/blob/main/USAGE.md" target="_blank" rel="noopener">USAGE</a> guide.
+    </p>
+  </div>
+</section>
+
+<!-- ============ LIMITS ============ -->
+<section id="limits">
+  <div class="wrap">
+    <span class="eyebrow">Honest scope</span>
+    <h2>What it deliberately doesn't do</h2>
+    <p class="sub">This is a focused v1 for single-developer use. The boundaries are intentional.</p>
+    <div class="limits">
+      <div>Single-turn only — no conversation history is forwarded to the external model.</div>
+      <div>No response streaming — the full reply arrives at once.</div>
+      <div>No caching, cost tracking, or budget enforcement — watch your provider dashboards.</div>
+      <div>No server-side rate limiting — it relies on the upstream provider's limits.</div>
+      <div>Stdio transport only — no HTTP or remote-access mode in v1.</div>
+      <div>Reachability is a key/outage probe — it doesn't validate the exact model name.</div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap frow">
+    <div class="brand" style="font-size:15px;">
+      <svg class="logo" viewBox="0 0 32 32" fill="none" style="width:22px;height:22px;">
+        <rect x="2" y="5" width="20" height="14" rx="4" fill="#7c8cff"/>
+        <rect x="10" y="13" width="20" height="14" rx="4" fill="#57e6c4"/>
+      </svg>
+      llm-second-opinion
+    </div>
+    <span>A local MCP server for cross-model second opinions.</span>
+    <span style="margin-left:auto;">
+      <a href="https://github.com/leenic/llm-second-opinion" target="_blank" rel="noopener">GitHub</a> ·
+      <a href="https://github.com/leenic/llm-second-opinion#readme" target="_blank" rel="noopener">README</a> ·
+      <a href="https://github.com/leenic/llm-second-opinion/blob/main/USAGE.md" target="_blank" rel="noopener">Usage</a>
+    </span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  // ---- Demo script: each entry is a timed step in the replay ----
+  var feed = document.getElementById('demoFeed');
+
+  var STEPS = [
+    { t: 'user', text: "What are the best to-do apps right now if I optimise purely for <b>quick capture</b> — getting a task in with the least friction? I want current options, not 2023's." },
+    { t: 'claude', text: "Off the top of my head: <b>Todoist</b> (natural-language quick add), <b>Things 3</b> (Quick Entry), <b>Apple Reminders</b> (Siri / lock screen) and <b>Drafts</b> (opens straight to a blank line). But “best right now” turns on current features and pricing that move fast — let me get a second opinion from models that can search the web, then reconcile." },
+    { t: 'tools' },
+    { t: 'opinions' },
+    { t: 'claude', text: "Reconciling the three: they <b>agree</b> the friction lives in the <i>capture trigger</i> more than the app — so <b>Drafts</b>, <b>Apple Reminders</b> and <b>Todoist</b> top everyone's list. They <b>differ</b> on platform: ChatGPT leans Apple-native, Gemini pushes cross-platform + voice, Grok argues the app barely matters next to a global hotkey. Two of them flagged a current detail my training lagged on. My take: on Apple, <b>Drafts + Reminders</b>; cross-platform, <b>Todoist or TickTick</b>. Want me to compare just those two?" }
+  ];
+
+  var OPINIONS = [
+    { cls: 'gpt', name: 'ChatGPT · gpt-5.5', tag: 'web_search', html: "Optimising for capture friction, <b>Drafts</b> wins on Apple — launch lands on an empty line, then route it anywhere. Pair with <b>Apple Reminders</b> for Siri and lock-screen capture. <b>Todoist</b>'s natural-language quick-add is the best cross-platform option. Skip heavyweight project tools here." },
+    { cls: 'gemini', name: 'Gemini · 3.1 Pro', tag: 'google_search', html: "If you're not all-Apple, weight <b>voice + widgets</b>: <b>Google Keep</b> and <b>Todoist</b> have the fastest Android capture, and <b>TickTick</b>'s home-screen quick-ball is excellent. Things 3 and Drafts are iOS-only — a real constraint if you switch devices." },
+    { cls: 'grok', name: 'Grok · 4.3', tag: 'web_search', html: "Contrarian take: the <b>app barely matters</b> — the capture <i>trigger</i> does. Whatever you pick, bind a global hotkey / Siri / a single widget. <b>Drafts</b> and <b>Todoist</b> are right, but watch sync friction; a fast app you can't trust to sync is worse than a plain note that does." }
+  ];
+
+  var timers = [];
+  function clearTimers(){ timers.forEach(clearTimeout); timers = []; }
+
+  function el(html){ var d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstChild; }
+
+  function renderStep(step, done){
+    if (step.t === 'user' || step.t === 'claude') {
+      var isUser = step.t === 'user';
+      var node = el(
+        '<div class="msg">' +
+          '<div class="avatar ' + (isUser ? 'av-user' : 'av-claude') + '">' + (isUser ? 'You' : 'C') + '</div>' +
+          '<div class="bubble ' + (isUser ? 'user' : '') + '">' +
+            '<div class="who">' + (isUser ? 'You' : 'Claude') + '</div>' + step.text +
+          '</div>' +
+        '</div>'
+      );
+      feed.appendChild(node);
+      requestAnimationFrame(function(){ node.classList.add('show'); });
+      timers.push(setTimeout(done, 60));
+    }
+    else if (step.t === 'tools') {
+      var row = el('<div class="toolrow"></div>');
+      ['chatgpt','gemini','grok'].forEach(function(m){
+        row.appendChild(el('<span class="toolchip"><span class="spin"></span>second_opinion · target=' + m + '</span>'));
+      });
+      feed.appendChild(row);
+      requestAnimationFrame(function(){ row.classList.add('show'); });
+      // flip each chip to "done" with a tick, staggered
+      var chips = row.querySelectorAll('.toolchip');
+      chips.forEach(function(chip, i){
+        timers.push(setTimeout(function(){
+          chip.classList.add('done');
+          chip.querySelector('.spin').outerHTML = '<span class="tick">✓</span>';
+        }, 500 + i * 350));
+      });
+      timers.push(setTimeout(done, 500 + chips.length * 350));
+    }
+    else if (step.t === 'opinions') {
+      var grid = el('<div class="opinions"></div>');
+      OPINIONS.forEach(function(o){
+        grid.appendChild(el(
+          '<div class="op ' + o.cls + '">' +
+            '<div class="op-head"><span class="swatch"></span>' + o.name + '<span class="tag">' + o.tag + '</span></div>' +
+            '<p>' + o.html + '</p>' +
+          '</div>'
+        ));
+      });
+      feed.appendChild(grid);
+      var cards = grid.querySelectorAll('.op');
+      cards.forEach(function(card, i){
+        timers.push(setTimeout(function(){ card.classList.add('show'); }, 120 + i * 420));
+      });
+      timers.push(setTimeout(done, 120 + cards.length * 420 + 200));
+    }
+  }
+
+  function play(){
+    clearTimers();
+    feed.innerHTML = '';
+    var i = 0;
+    function next(){
+      if (i >= STEPS.length) return;
+      var step = STEPS[i++];
+      // pacing: reading time before the next step appears
+      var pause = step.t === 'user' ? 700 : step.t === 'tools' ? 350 : step.t === 'opinions' ? 500 : 1500;
+      renderStep(step, function(){ timers.push(setTimeout(next, pause)); });
+    }
+    next();
+  }
+
+  document.getElementById('replayBtn').addEventListener('click', play);
+
+  // Auto-play once when the demo scrolls into view
+  var started = false;
+  if ('IntersectionObserver' in window) {
+    var obs = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if (e.isIntersecting && !started){ started = true; play(); obs.disconnect(); }
+      });
+    }, { threshold: 0.35 });
+    obs.observe(document.getElementById('demoShell'));
+  } else {
+    play();
+  }
+})();
+</script>
+</body>
+</html>

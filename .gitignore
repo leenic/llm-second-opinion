@@ -1,5 +1,7 @@
-# Local config (contains API keys)
-config.json
+# Local config (contains API keys). Ignore every config*.json variant
+# (config.json, config.fast.json, etc.) but keep the placeholder example.
+config*.json
+!config.example.json
 .env
 
 # Python
