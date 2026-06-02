@@ -58,7 +58,17 @@ class ResponsesAPIProvider(Provider):
         return self.model
 
     def _client(self) -> AsyncOpenAI:
-        kwargs: dict[str, Any] = {"api_key": self.api_key, "timeout": self.timeout}
+        # max_retries=0: the SDK defaults to 2, but on a slow reasoning+web_search
+        # call each retry restarts the full request. Stacked retries blow past the
+        # MCP client's ~240s tool-call deadline, so the call is cancelled before we
+        # can return our own `timeout` error. With retries off, `self.timeout`
+        # actually bounds wall-clock time and a timeout surfaces cleanly. Claude can
+        # re-issue the whole tool call (our errors carry `retriable`).
+        kwargs: dict[str, Any] = {
+            "api_key": self.api_key,
+            "timeout": self.timeout,
+            "max_retries": 0,
+        }
         if self.base_url:
             kwargs["base_url"] = self.base_url
         return AsyncOpenAI(**kwargs)
