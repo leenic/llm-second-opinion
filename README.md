@@ -16,7 +16,7 @@ Each call is single-turn. No conversation history is forwarded to the external m
 | Provider | Interface | Default model | SDK |
 |---|---|---|---|
 | ChatGPT (OpenAI) | Responses API (`client.responses.create`) | `gpt-5.5` | `openai>=2.36` |
-| Gemini (Google) | Interactions API (`client.aio.interactions.create`) | `gemini-3.1-pro-preview` | `google-genai>=1.55` |
+| Gemini (Google) | Interactions API (`client.aio.interactions.create`) | `gemini-3.1-pro-preview` | `google-genai>=2.0` |
 | Grok (xAI) | Responses API via OpenAI-compatible base URL (`https://api.x.ai/v1`) | `grok-4.3` | `openai>=2.36` |
 
 These are the stateful/agentic-first interfaces each provider now recommends for new integrations. We call them in single-turn mode (no `previous_response_id`, no Interactions session state) because v1 of this server forwards no conversation history.

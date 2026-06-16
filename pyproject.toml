@@ -13,7 +13,7 @@ authors = [{ name = "llm-second-opinion contributors" }]
 dependencies = [
     "mcp>=1.2.0",
     "openai>=2.36,<3",
-    "google-genai>=1.55,<2",
+    "google-genai>=2.0,<3",
 ]
 
 [project.optional-dependencies]

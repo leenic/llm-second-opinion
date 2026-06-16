@@ -11,10 +11,17 @@ Request shape (from `client.aio.interactions.create`):
 - generation_config: {temperature, max_output_tokens, thinking_level, ...}
 - tools: list[{type, ...}]
 
-Response shape (`Interaction`):
-- status: "completed" | "failed" | "cancelled" | "incomplete" | "in_progress"
-- outputs: list[Content] where each text item has type=="text" and .text
-- usage: total_input_tokens / total_output_tokens / total_tokens / total_thought_tokens
+Response shape (`Interaction`), as of the May 2026 Interactions breaking
+change (google-genai >= 2.0 — see ai.google.dev/gemini-api/docs/
+interactions-breaking-changes-may-2026):
+- status: "completed" | "failed" | "cancelled" | "incomplete" |
+  "in_progress" | "requires_action" | "budget_exceeded"
+- steps: list[Step] (replaces the old `outputs` list). The model's text
+  lives in steps with type=="model_output", whose `.content` is a list of
+  blocks where each text block has type=="text" and `.text`. Other step
+  types (thoughts, tool calls/results) are interleaved and ignored here.
+- usage: total_input_tokens / total_output_tokens / total_tokens /
+  total_thought_tokens (unchanged across the 2.0 migration)
 """
 
 from __future__ import annotations
@@ -115,6 +122,12 @@ class GeminiProvider(Provider):
                 f"gemini interaction failed (status={status})",
                 retriable=False,
             )
+        if status == "budget_exceeded":
+            raise ProviderError(
+                "upstream_error",
+                f"gemini interaction exceeded its budget (status={status})",
+                retriable=False,
+            )
         if status in ("cancelled", "incomplete"):
             raise ProviderError(
                 "content_blocked",
@@ -186,13 +199,26 @@ def _translate_genai_error(e: genai_errors.APIError) -> ProviderError:
 
 
 def _join_output_text(response: Any) -> str:
-    """Walk `response.outputs` and concatenate every text-type content block."""
+    """Concatenate the model's text from `response.steps`.
+
+    Since the May 2026 Interactions breaking change the response is a `steps`
+    timeline rather than a flat `outputs` list. We pull text only from
+    `model_output` steps (skipping thoughts and tool-call/result steps), and
+    within each, only the `text`-type content blocks.
+
+    The SDK exposes an `output_text` convenience property, but we walk the
+    steps ourselves with `getattr` so parsing stays robust if the SDK swaps
+    model classes and never hard-depends on that property existing.
+    """
     parts: list[str] = []
-    for item in getattr(response, "outputs", None) or []:
-        if getattr(item, "type", None) == "text":
-            t = getattr(item, "text", None)
-            if t:
-                parts.append(t)
+    for step in getattr(response, "steps", None) or []:
+        if getattr(step, "type", None) != "model_output":
+            continue
+        for block in getattr(step, "content", None) or []:
+            if getattr(block, "type", None) == "text":
+                t = getattr(block, "text", None)
+                if t:
+                    parts.append(t)
     return "".join(parts)
 
 
