@@ -11,10 +11,17 @@ Request shape (from `client.aio.interactions.create`):
 - generation_config: {temperature, max_output_tokens, thinking_level, ...}
 - tools: list[{type, ...}]
 
-Response shape (`Interaction`):
-- status: "completed" | "failed" | "cancelled" | "incomplete" | "in_progress"
-- outputs: list[Content] where each text item has type=="text" and .text
-- usage: total_input_tokens / total_output_tokens / total_tokens / total_thought_tokens
+Response shape (`Interaction`), as of the May 2026 Interactions breaking
+change (google-genai >= 2.0 — see ai.google.dev/gemini-api/docs/
+interactions-breaking-changes-may-2026):
+- status: "completed" | "failed" | "cancelled" | "incomplete" |
+  "in_progress" | "requires_action" | "budget_exceeded"
+- steps: list[Step] (replaces the old `outputs` list). The model's text
+  lives in steps with type=="model_output", whose `.content` is a list of
+  blocks where each text block has type=="text" and `.text`. Other step
+  types (thoughts, tool calls/results) are interleaved and ignored here.
+- usage: total_input_tokens / total_output_tokens / total_tokens /
+  total_thought_tokens (unchanged across the 2.0 migration)
 """
 
 from __future__ import annotations
@@ -115,6 +122,12 @@ class GeminiProvider(Provider):
                 f"gemini interaction failed (status={status})",
                 retriable=False,
             )
+        if status == "budget_exceeded":
+            raise ProviderError(
+                "upstream_error",
+                f"gemini interaction exceeded its budget (status={status})",
+                retriable=False,
+            )
         if status in ("cancelled", "incomplete"):
             raise ProviderError(
                 "content_blocked",
@@ -186,13 +199,51 @@ def _translate_genai_error(e: genai_errors.APIError) -> ProviderError:
 
 
 def _join_output_text(response: Any) -> str:
-    """Walk `response.outputs` and concatenate every text-type content block."""
+    """Return Gemini's final answer text from the Interaction.
+
+    Since the May 2026 Interactions breaking change the response is a `steps`
+    timeline rather than a flat `outputs` list, and a single interaction may
+    carry several `model_output` steps interleaved with thought and
+    tool-call/result steps (e.g. when `web_search` grounding runs). We must
+    return only the *trailing* run of model output — concatenating every
+    `model_output` step would prepend intermediate model chatter to the final
+    answer.
+
+    We prefer the SDK's `output_text` property, which already returns exactly
+    that trailing run. If it is unavailable we fall back to a manual walk that
+    mirrors the same semantics, matching on the `type` discriminator with
+    `getattr` so parsing stays robust if the SDK swaps model classes.
+    """
+    sdk_text = getattr(response, "output_text", None)
+    if isinstance(sdk_text, str):
+        return sdk_text
+
+    # Fallback: walk the timeline backwards, collecting the trailing run of
+    # model-output text and stopping at the first non-model-output boundary.
     parts: list[str] = []
-    for item in getattr(response, "outputs", None) or []:
-        if getattr(item, "type", None) == "text":
-            t = getattr(item, "text", None)
-            if t:
-                parts.append(t)
+    collecting = False
+    for step in reversed(getattr(response, "steps", None) or []):
+        step_type = getattr(step, "type", None)
+        if step_type == "user_input":
+            break
+        content = getattr(step, "content", None)
+        if step_type != "model_output" or not content:
+            if collecting:
+                break
+            continue
+        hit_barrier = False
+        for block in reversed(content):
+            if getattr(block, "type", None) == "text":
+                collecting = True
+                t = getattr(block, "text", None)
+                if t:
+                    parts.append(t)
+            elif collecting:
+                hit_barrier = True
+                break
+        if hit_barrier:
+            break
+    parts.reverse()
     return "".join(parts)
 
 
