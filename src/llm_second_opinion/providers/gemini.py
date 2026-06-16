@@ -199,26 +199,51 @@ def _translate_genai_error(e: genai_errors.APIError) -> ProviderError:
 
 
 def _join_output_text(response: Any) -> str:
-    """Concatenate the model's text from `response.steps`.
+    """Return Gemini's final answer text from the Interaction.
 
     Since the May 2026 Interactions breaking change the response is a `steps`
-    timeline rather than a flat `outputs` list. We pull text only from
-    `model_output` steps (skipping thoughts and tool-call/result steps), and
-    within each, only the `text`-type content blocks.
+    timeline rather than a flat `outputs` list, and a single interaction may
+    carry several `model_output` steps interleaved with thought and
+    tool-call/result steps (e.g. when `web_search` grounding runs). We must
+    return only the *trailing* run of model output — concatenating every
+    `model_output` step would prepend intermediate model chatter to the final
+    answer.
 
-    The SDK exposes an `output_text` convenience property, but we walk the
-    steps ourselves with `getattr` so parsing stays robust if the SDK swaps
-    model classes and never hard-depends on that property existing.
+    We prefer the SDK's `output_text` property, which already returns exactly
+    that trailing run. If it is unavailable we fall back to a manual walk that
+    mirrors the same semantics, matching on the `type` discriminator with
+    `getattr` so parsing stays robust if the SDK swaps model classes.
     """
+    sdk_text = getattr(response, "output_text", None)
+    if isinstance(sdk_text, str):
+        return sdk_text
+
+    # Fallback: walk the timeline backwards, collecting the trailing run of
+    # model-output text and stopping at the first non-model-output boundary.
     parts: list[str] = []
-    for step in getattr(response, "steps", None) or []:
-        if getattr(step, "type", None) != "model_output":
+    collecting = False
+    for step in reversed(getattr(response, "steps", None) or []):
+        step_type = getattr(step, "type", None)
+        if step_type == "user_input":
+            break
+        content = getattr(step, "content", None)
+        if step_type != "model_output" or not content:
+            if collecting:
+                break
             continue
-        for block in getattr(step, "content", None) or []:
+        hit_barrier = False
+        for block in reversed(content):
             if getattr(block, "type", None) == "text":
+                collecting = True
                 t = getattr(block, "text", None)
                 if t:
                     parts.append(t)
+            elif collecting:
+                hit_barrier = True
+                break
+        if hit_barrier:
+            break
+    parts.reverse()
     return "".join(parts)
 
 
