@@ -249,6 +249,49 @@ class TestUnsupportedParamRetry:
         assert resp.latency_ms >= 0  # measured across the retry, not reset
 
     @pytest.mark.asyncio
+    async def test_retry_is_charged_only_the_remaining_timeout(
+        self, make_provider, request_factory
+    ):
+        """`max_retries=0` exists so `timeout` bounds total wall-clock against
+        the MCP client's ~240s cap. A retry on a fresh full budget would allow
+        2x that, reintroducing the exact failure that setting prevents."""
+        provider, calls = make_provider(
+            [bad_request(UNSUPPORTED_TEMPERATURE), responses_result(text_message(ANSWER))],
+            timeout=30.0,
+        )
+        await provider.generate(request_factory(temperature=0.2))
+
+        assert len(calls.timeouts) == 1, "retry must override the client timeout"
+        remaining = calls.timeouts[0]
+        assert 0 < remaining <= 30.0
+
+    @pytest.mark.asyncio
+    async def test_no_timeout_override_when_there_is_no_retry(
+        self, make_provider, request_factory
+    ):
+        provider, calls = make_provider(responses_result(text_message(ANSWER)))
+        await provider.generate(request_factory())
+        assert calls.timeouts == []
+
+    @pytest.mark.asyncio
+    async def test_exhausted_budget_surfaces_the_original_error(
+        self, make_provider, request_factory
+    ):
+        """With no time left, retrying would overrun the deadline — report the
+        rejection instead of starting a request that cannot legally finish."""
+        provider, calls = make_provider(
+            [bad_request(UNSUPPORTED_TEMPERATURE), responses_result(text_message(ANSWER))],
+            timeout=0.0,
+        )
+        with pytest.raises(ProviderError) as exc:
+            await provider.generate(request_factory(temperature=0.2))
+
+        assert exc.value.error_type == "bad_request"
+        assert "temperature" in exc.value.message
+        assert len(calls) == 1
+        assert calls.timeouts == []
+
+    @pytest.mark.asyncio
     async def test_no_retry_when_temperature_was_not_sent(
         self, make_provider, request_factory
     ):

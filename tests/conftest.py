@@ -101,12 +101,37 @@ UNSUPPORTED_TEMPERATURE = (
 )
 
 
+class CallLog(list):
+    """The kwargs of each `responses.create` call, plus `.timeouts` — the
+    timeout override each retry was given."""
+
+    timeouts: list
+
+
+class FakeClient:
+    """Stand-in for `AsyncOpenAI`.
+
+    Models `with_options` because the retry path uses it to charge the second
+    attempt only the time left on the original deadline; `timeouts` records
+    what each attempt was given so tests can assert the budget shrinks.
+    """
+
+    def __init__(self, create, timeouts: list[float | None]):
+        self.responses = SimpleNamespace(create=create)
+        self.timeouts = timeouts
+
+    def with_options(self, **options):
+        self.timeouts.append(options.get("timeout"))
+        return self
+
+
 @pytest.fixture
 def make_provider():
     """Build a provider whose HTTP client is replaced by a stub.
 
     Returns (provider, calls) — `calls` accumulates the kwargs each
-    `responses.create` was invoked with.
+    `responses.create` was invoked with, and `calls.timeouts` the timeout
+    override passed to each retry.
     """
 
     def _make(result: Any, cls=None, **provider_kwargs):
@@ -115,7 +140,8 @@ def make_provider():
         from llm_second_opinion.providers.openai_provider import OpenAIProvider
 
         cls = cls or OpenAIProvider
-        calls: list[dict] = []
+        calls = CallLog()
+        calls.timeouts = []
         queue = list(result) if isinstance(result, list) else None
 
         async def _create(**kwargs):
@@ -129,8 +155,8 @@ def make_provider():
         kwargs = {"api_key": "test-key", "model": "test-model", "timeout": 30.0}
         kwargs.update(provider_kwargs)
         provider = cls(**kwargs)
-        provider._client = lambda: SimpleNamespace(  # type: ignore[method-assign]
-            responses=SimpleNamespace(create=_create)
+        provider._client = lambda: FakeClient(  # type: ignore[method-assign]
+            _create, calls.timeouts
         )
         return provider, calls
 

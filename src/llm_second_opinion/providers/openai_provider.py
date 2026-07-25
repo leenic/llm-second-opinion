@@ -122,12 +122,23 @@ class ResponsesAPIProvider(Provider):
             dropped = _droppable_unsupported_param(e, kwargs)
             if dropped is None:
                 raise
+            # The retry must fit inside the *original* deadline. `self.timeout`
+            # is bound to the client at construction, so a second `_create`
+            # would silently get a fresh full budget and let one tool call run
+            # up to 2x `timeout_seconds` — past the MCP client's ~240s cap,
+            # which is the exact failure `max_retries=0` above exists to
+            # prevent. Charge the retry only what's left.
+            remaining = self.timeout - (time.monotonic() - start)
+            if remaining <= 0:
+                raise
             log.warning(
-                "%s model=%s rejected %r; retrying without it",
-                self.name, self.model, dropped,
+                "%s model=%s rejected %r; retrying without it (%.1fs left)",
+                self.name, self.model, dropped, remaining,
             )
             kwargs.pop(dropped)
-            response = await self._create(client, kwargs)
+            response = await self._create(
+                client.with_options(timeout=remaining), kwargs
+            )
 
         latency_ms = int((time.monotonic() - start) * 1000)
         return self._build_response(response, latency_ms)
