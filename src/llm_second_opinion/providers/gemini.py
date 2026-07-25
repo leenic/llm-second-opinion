@@ -1,4 +1,4 @@
-"""Gemini provider via Google's Interactions API (google-genai SDK >= 1.55).
+"""Gemini provider via Google's Interactions API (google-genai SDK >= 2.0).
 
 The Interactions API is Google's stateful counterpart to OpenAI's Responses
 API. We use it in single-turn mode — no `previous_interaction_id`, no

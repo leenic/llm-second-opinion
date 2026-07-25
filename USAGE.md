@@ -43,9 +43,9 @@ There's no universal best. Rough heuristics:
 
 | Situation | Try first |
 |---|---|
-| Long codebase summaries, careful reasoning, multimodal | **Gemini** (`gemini-3.1-pro-preview`) — strong long-context and reasoning. |
-| Deep tool-use thinking, careful refactoring critique | **ChatGPT** (`gpt-5.5`) — current OpenAI flagship, deepest tool-aware reasoning. |
-| Want a sharper, more contrarian take; also good price/performance | **Grok** (`grok-4.3`). |
+| Long codebase summaries, careful reasoning, multimodal | **Gemini** (`gemini-3.6-flash`) — strong long-context, and the fastest of the three (~17–19s on a typical review). |
+| Deep tool-use thinking, careful refactoring critique | **ChatGPT** (`gpt-5.6-sol`) — current OpenAI flagship, deepest tool-aware reasoning. Reasoning-only: it rejects `temperature`. |
+| Want a sharper, more contrarian take; also good price/performance | **Grok** (`grok-4.5`) — searches the web most aggressively of the three, and is correspondingly the slowest (~44–50s). |
 | Need fresh facts (post-cutoff news, library docs, current pricing) | Whichever has `web_search: true` in your config — see below. |
 
 When in doubt, ask the same question of two of them and compare. Claude is happy to do that in one turn.
@@ -56,7 +56,7 @@ When you ask Claude to call the tool, you can shape the call by mentioning these
 
 - **`focus`** — narrow the reviewer's attention. *"…focus on whether the rollback plan is realistic."*
 - **`system_prompt`** — replace the default reviewer persona. The default tells the external model to be direct, critical, and skip the praise. Override it only when you want a different kind of feedback (e.g., *"…use system_prompt: 'you are a hostile pentest reviewer'"*).
-- **`temperature`** — pass a number if you want it more deterministic (0–0.3) or more creative (0.8+). Most flagships ignore this for reasoning tracks anyway.
+- **`temperature`** — pass a number if you want it more deterministic (0–0.3) or more creative (0.8+). Most flagships ignore this for reasoning tracks anyway. **`gpt-5.6-sol` does not ignore it — it rejects the whole call with `bad_request`.** Only send `temperature` to `grok` or `gemini`; if a ChatGPT call fails this way, retry without it.
 - **`max_tokens`** — cap the length of the reply. Useful when you only want a quick verdict.
 
 You don't need to remember the arg names — say what you want and Claude will map it.
@@ -80,7 +80,7 @@ A successful call returns something like:
 {
   "success": true,
   "provider": "gemini",
-  "model": "gemini-3.1-pro-preview-2026-05",
+  "model": "gemini-3.6-flash",
   "response": "The plan has two problems...",
   "usage": { "input_tokens": 412, "output_tokens": 1031, "total_tokens": 1443 },
   "latency_ms": 4820

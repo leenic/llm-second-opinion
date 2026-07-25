@@ -15,9 +15,9 @@ from pathlib import Path
 ENV_PREFIX = "LLM_SECOND_OPINION_"
 
 DEFAULT_MODELS = {
-    "openai": "gpt-5.5",
-    "gemini": "gemini-3.1-pro-preview",
-    "grok": "grok-4.3",
+    "openai": "gpt-5.6-sol",
+    "gemini": "gemini-3.6-flash",
+    "grok": "grok-4.5",
 }
 
 DEFAULT_TIMEOUT_SECONDS = 180.0
