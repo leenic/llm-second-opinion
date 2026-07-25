@@ -20,6 +20,6 @@
     }
   },
   "request_budget_seconds": 200,
-  "default_max_tokens": 8000,
+  "default_max_tokens": 32000,
   "log_prompts": false
 }

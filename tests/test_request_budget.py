@@ -64,7 +64,7 @@ class StubProvider(Provider):
         return True, None
 
 
-def make_config(budget: float = 0.05, default_max_tokens: int | None = 8000) -> AppConfig:
+def make_config(budget: float = 0.05, default_max_tokens: int | None = 32000) -> AppConfig:
     return AppConfig(
         providers={
             "openai": ProviderConfig(api_key="k", model="m"),
@@ -219,13 +219,13 @@ class TestDefaultMaxTokens:
     @pytest.mark.asyncio
     async def test_applied_when_caller_omits_max_tokens(self, call_tool):
         provider = StubProvider()
-        await call_tool(provider, make_config(default_max_tokens=8000))()
-        assert provider.requests[0].max_tokens == 8000
+        await call_tool(provider, make_config(default_max_tokens=32000))()
+        assert provider.requests[0].max_tokens == 32000
 
     @pytest.mark.asyncio
     async def test_caller_value_wins(self, call_tool):
         provider = StubProvider()
-        await call_tool(provider, make_config(default_max_tokens=8000))(max_tokens=123)
+        await call_tool(provider, make_config(default_max_tokens=32000))(max_tokens=123)
         assert provider.requests[0].max_tokens == 123
 
     @pytest.mark.asyncio
@@ -238,7 +238,7 @@ class TestDefaultMaxTokens:
     async def test_explicit_zero_is_not_overridden_by_the_default(self, call_tool):
         """0 is falsy — the check must be `is not None`, not truthiness."""
         provider = StubProvider()
-        await call_tool(provider, make_config(default_max_tokens=8000))(max_tokens=0)
+        await call_tool(provider, make_config(default_max_tokens=32000))(max_tokens=0)
         assert provider.requests[0].max_tokens == 0
 
 

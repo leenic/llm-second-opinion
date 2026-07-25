@@ -63,7 +63,7 @@ A provider with no key (or with the `REPLACE-ME` placeholder) is treated as unav
 | `providers.<name>.reasoning_effort` | Optional. One of `minimal`, `low`, `medium`, `high`. Omit to use the provider's default thinking depth |
 | `providers.<name>.web_search` | Optional `true`/`false`. Attaches the provider's built-in web search tool to every call. Default `false` |
 | `request_budget_seconds` | Wall-clock bound on one whole tool call (default 200). See [Bounding call duration](#bounding-call-duration) below. Formerly `timeout_seconds`, which still works but warns |
-| `default_max_tokens` | Reply cap applied when the caller passes no `max_tokens` (default 8000). Set to `null` to leave replies unbounded. Long calls correlate with large reasoning+output token counts, so this is the main lever on tail latency |
+| `default_max_tokens` | Reply cap applied when the caller passes no `max_tokens` (default 32000). Set to `null` to leave replies unbounded. See [Choosing the reply cap](#choosing-the-reply-cap) — a cap that is too tight fails the call outright rather than returning a shorter answer |
 | `log_prompts` | If `true`, prompts and responses are written to the log. Off by default |
 
 #### Bounding call duration
@@ -82,6 +82,22 @@ A provider with no key (or with the `REPLACE-ME` placeholder) is treated as unav
 ```
 
 The same value is used for the provider's HTTP client timeout, so the socket is actually torn down rather than left open behind a cancelled coroutine. Keep it comfortably under 240 — the server warns at load if you set it at or above 235, and honours the value anyway in case your MCP client allows longer.
+
+#### Choosing the reply cap
+
+`default_max_tokens` is not a "shorten the answer" knob. A reply that hits the cap comes back `incomplete` and surfaces as an error — **you get nothing, not a shorter answer** — so setting it too tight is worse than setting it too loose.
+
+The real ceiling is `request_budget_seconds`, not the provider API. Measured against the live providers on a long-form prompt:
+
+| Model | Hard output cap | Sustained rate | Reachable in 200s |
+|---|---|---|---|
+| `gemini-3.6-flash` | 65,536 | ~178 tok/s | ~35,000 |
+| `gpt-5.6-sol` | none published | ~62 tok/s | ~12,000 |
+| `grok-4.5` | none published | ~49 tok/s | ~10,000 |
+
+OpenAI and xAI accepted `max_output_tokens=10_000_000` without complaint, so nothing stops you setting a huge value — but at 60,000 both of them burned the full 200s budget and returned nothing at all. Past roughly 12k the extra headroom is inert for them; the deadline arrives first.
+
+The 32,000 default sits above every real answer observed (largest: 14,129 billed tokens), under Gemini's hard limit, and left the slowest provider at 53% of budget on a full review. If you still see replies cut short, raise it — but if you start seeing `timeout` instead, the answer genuinely doesn't fit in the budget and the fix is a narrower prompt or a lower `reasoning_effort`, not a bigger cap.
 
 This is a tail-latency guard, not a throughput fix. Measured on a ~60-word review prompt with `web_search` on: `gemini-3.6-flash` ~17–19s (`high`), `gpt-5.6-sol` ~21s (`medium`), `grok-4.5` ~44–50s (`high`). A long, open-ended review prompt pushes `gpt-5.6-sol` past 80s. The OpenAI/Grok client also uses `max_retries=0` so SDK retries can't stack past the budget.
 
