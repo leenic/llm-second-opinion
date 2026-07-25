@@ -12,7 +12,14 @@ import json
 import pytest
 
 from llm_second_opinion import config as config_mod
-from llm_second_opinion.config import DEFAULT_MODELS, ConfigError, load_config
+from llm_second_opinion.config import (
+    CLIENT_HARD_CAP_SECONDS,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_MODELS,
+    DEFAULT_REQUEST_BUDGET_SECONDS,
+    ConfigError,
+    load_config,
+)
 
 
 @pytest.fixture
@@ -71,6 +78,110 @@ class TestApiKeys:
         assert load_config().providers["openai"].api_key == "sk-env"
 
 
+class TestRequestBudget:
+    def test_default_leaves_headroom_under_the_client_cap(self):
+        """Desktop cancels at 240s and discards the result; our own error is
+        only useful if it fires first."""
+        assert DEFAULT_REQUEST_BUDGET_SECONDS < CLIENT_HARD_CAP_SECONDS
+        assert CLIENT_HARD_CAP_SECONDS - DEFAULT_REQUEST_BUDGET_SECONDS >= 30
+
+    def test_absent_key_uses_the_default(self, config_env):
+        config_env({"providers": {}})
+        cfg = load_config()
+        assert cfg.request_budget_seconds == DEFAULT_REQUEST_BUDGET_SECONDS
+        assert cfg.warnings == []
+
+    def test_explicit_value_is_used(self, config_env):
+        config_env({"providers": {}, "request_budget_seconds": 90})
+        assert load_config().request_budget_seconds == 90.0
+
+    def test_legacy_timeout_seconds_still_works(self, config_env):
+        """An existing deployment must not silently lose its tuned value."""
+        config_env({"providers": {}, "timeout_seconds": 150})
+        cfg = load_config()
+        assert cfg.request_budget_seconds == 150.0
+        assert any("deprecated" in w for w in cfg.warnings)
+
+    def test_new_key_wins_over_legacy_and_the_clash_is_reported(self, config_env):
+        config_env({
+            "providers": {},
+            "request_budget_seconds": 90,
+            "timeout_seconds": 150,
+        })
+        cfg = load_config()
+        assert cfg.request_budget_seconds == 90.0
+        assert any("both" in w for w in cfg.warnings)
+
+    def test_budget_at_or_above_the_cap_is_warned_about(self, config_env):
+        config_env({"providers": {}, "request_budget_seconds": 240})
+        cfg = load_config()
+        assert cfg.request_budget_seconds == 240.0  # honoured, not clamped
+        assert any("240" in w for w in cfg.warnings)
+
+    def test_env_override(self, config_env, monkeypatch):
+        config_env({"providers": {}, "request_budget_seconds": 90})
+        monkeypatch.setenv(f"{config_mod.ENV_PREFIX}REQUEST_BUDGET", "45")
+        assert load_config().request_budget_seconds == 45.0
+
+    def test_legacy_env_override_still_works(self, config_env, monkeypatch):
+        config_env({"providers": {}})
+        monkeypatch.setenv(f"{config_mod.ENV_PREFIX}TIMEOUT", "45")
+        assert load_config().request_budget_seconds == 45.0
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_non_positive_is_rejected(self, config_env, value):
+        config_env({"providers": {}, "request_budget_seconds": value})
+        with pytest.raises(ConfigError, match="request_budget_seconds"):
+            load_config()
+
+    def test_unparseable_is_rejected(self, config_env):
+        config_env({"providers": {}, "request_budget_seconds": "soon"})
+        with pytest.raises(ConfigError, match="request_budget_seconds"):
+            load_config()
+
+    def test_timeout_seconds_alias_reads_the_budget(self, config_env):
+        config_env({"providers": {}, "request_budget_seconds": 90})
+        cfg = load_config()
+        assert cfg.timeout_seconds == cfg.request_budget_seconds
+
+
+class TestDefaultMaxTokens:
+    def test_absent_key_uses_the_default(self, config_env):
+        config_env({"providers": {}})
+        assert load_config().default_max_tokens == DEFAULT_MAX_TOKENS
+
+    def test_explicit_value_is_used(self, config_env):
+        config_env({"providers": {}, "default_max_tokens": 1234})
+        assert load_config().default_max_tokens == 1234
+
+    def test_explicit_null_disables_the_cap(self, config_env):
+        """Distinct from an absent key, which falls back to the default."""
+        config_env({"providers": {}, "default_max_tokens": None})
+        assert load_config().default_max_tokens is None
+
+    @pytest.mark.parametrize("value", [0, -5])
+    def test_non_positive_is_rejected(self, config_env, value):
+        config_env({"providers": {}, "default_max_tokens": value})
+        with pytest.raises(ConfigError, match="default_max_tokens"):
+            load_config()
+
+    def test_unparseable_is_rejected(self, config_env):
+        config_env({"providers": {}, "default_max_tokens": "lots"})
+        with pytest.raises(ConfigError, match="default_max_tokens"):
+            load_config()
+
+    def test_env_override(self, config_env, monkeypatch):
+        config_env({"providers": {}, "default_max_tokens": 1234})
+        monkeypatch.setenv(f"{config_mod.ENV_PREFIX}DEFAULT_MAX_TOKENS", "555")
+        assert load_config().default_max_tokens == 555
+
+    @pytest.mark.parametrize("value", ["none", "null", ""])
+    def test_env_can_disable_the_cap(self, config_env, monkeypatch, value):
+        config_env({"providers": {}, "default_max_tokens": 1234})
+        monkeypatch.setenv(f"{config_mod.ENV_PREFIX}DEFAULT_MAX_TOKENS", value)
+        assert load_config().default_max_tokens is None
+
+
 class TestValidation:
     def test_bad_reasoning_effort_is_rejected(self, config_env):
         config_env({"providers": {"openai": {"api_key": "x", "reasoning_effort": "max"}}})
@@ -81,9 +192,9 @@ class TestValidation:
         config_env({"providers": {"openai": {"api_key": "x", "reasoning_effort": " HIGH "}}})
         assert load_config().providers["openai"].reasoning_effort == "high"
 
-    def test_non_positive_timeout_is_rejected(self, config_env):
-        config_env({"providers": {}, "timeout_seconds": 0})
-        with pytest.raises(ConfigError, match="timeout_seconds"):
+    def test_non_positive_budget_is_rejected(self, config_env):
+        config_env({"providers": {}, "request_budget_seconds": 0})
+        with pytest.raises(ConfigError, match="request_budget_seconds"):
             load_config()
 
     def test_providers_must_be_an_object(self, config_env):

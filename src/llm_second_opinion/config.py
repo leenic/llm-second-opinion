@@ -20,7 +20,28 @@ DEFAULT_MODELS = {
     "grok": "grok-4.5",
 }
 
-DEFAULT_TIMEOUT_SECONDS = 180.0
+# One budget bounds the whole tool call: the outer `asyncio.wait_for` in the
+# handler AND the provider's own HTTP client timeout are both set from it, so
+# the socket actually closes instead of leaving a cancelled coroutine with an
+# open connection.
+#
+# Claude Desktop enforces a hard, non-configurable 240s cap on tool calls and
+# cancels with `MCP error -32001: Request timed out`, discarding the result
+# even when the upstream call succeeded. Staying under that cap means we
+# return our own structured error, which the calling model can act on.
+DEFAULT_REQUEST_BUDGET_SECONDS = 200.0
+
+# Above this, Desktop's cap would fire before ours and the result is lost.
+# Not an error — another MCP client may allow longer — but always warned about.
+CLIENT_HARD_CAP_SECONDS = 240.0
+BUDGET_WARN_THRESHOLD_SECONDS = 235.0
+
+# Applied when the caller omits `max_tokens`. Long calls correlate with large
+# reasoning+output token counts, so an unbounded reply is the main driver of
+# tail latency. 8000 is roughly 4x the largest reply observed in testing
+# (grok-4.5 at 2021 output tokens), so it caps runaway generation without
+# truncating realistic answers. Set to null to leave replies unbounded.
+DEFAULT_MAX_TOKENS = 8000
 
 REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
 
@@ -40,10 +61,22 @@ class ProviderConfig:
 @dataclass
 class AppConfig:
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
-    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    # Bounds one whole tool call — see DEFAULT_REQUEST_BUDGET_SECONDS.
+    request_budget_seconds: float = DEFAULT_REQUEST_BUDGET_SECONDS
+    # Cap applied when the caller passes no `max_tokens`. None = unbounded.
+    default_max_tokens: int | None = DEFAULT_MAX_TOKENS
     log_prompts: bool = False
     log_level: str = "INFO"
     config_path: Path | None = None
+    # Non-fatal config problems, logged to stderr by main() once the logger
+    # exists. load_config() runs before logging is configured, so it cannot
+    # emit these itself.
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def timeout_seconds(self) -> float:
+        """Deprecated alias. The HTTP client timeout is the request budget."""
+        return self.request_budget_seconds
 
 
 def _candidate_paths() -> list[Path]:
@@ -134,15 +167,9 @@ def load_config() -> AppConfig:
             web_search=web_search,
         )
 
-    timeout_seconds = float(raw.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
-    env_timeout = os.environ.get(f"{ENV_PREFIX}TIMEOUT")
-    if env_timeout:
-        try:
-            timeout_seconds = float(env_timeout)
-        except ValueError as e:
-            raise ConfigError(f"Invalid {ENV_PREFIX}TIMEOUT: {env_timeout}") from e
-    if timeout_seconds <= 0:
-        raise ConfigError("timeout_seconds must be > 0")
+    warnings: list[str] = []
+    request_budget_seconds = _load_request_budget(raw, warnings)
+    default_max_tokens = _load_default_max_tokens(raw)
 
     log_prompts = bool(raw.get("log_prompts", False))
     if f"{ENV_PREFIX}LOG_PROMPTS" in os.environ:
@@ -152,8 +179,85 @@ def load_config() -> AppConfig:
 
     return AppConfig(
         providers=providers,
-        timeout_seconds=timeout_seconds,
+        request_budget_seconds=request_budget_seconds,
+        default_max_tokens=default_max_tokens,
         log_prompts=log_prompts,
         log_level=log_level,
         config_path=path,
+        warnings=warnings,
     )
+
+
+def _load_request_budget(raw: dict, warnings: list[str]) -> float:
+    """Resolve the per-call budget.
+
+    `timeout_seconds` is the pre-existing name for this value and still works,
+    so upgrading doesn't silently reset an operator's tuned value. If both are
+    present `request_budget_seconds` wins and the conflict is reported.
+    """
+    legacy = raw.get("timeout_seconds")
+    current = raw.get("request_budget_seconds")
+    if current is not None and legacy is not None:
+        warnings.append(
+            "config sets both `request_budget_seconds` and the deprecated "
+            f"`timeout_seconds`; using request_budget_seconds={current!r} and "
+            f"ignoring timeout_seconds={legacy!r}"
+        )
+    elif current is None and legacy is not None:
+        warnings.append(
+            "`timeout_seconds` is deprecated; rename it to "
+            "`request_budget_seconds` (same meaning, bounds the whole call)"
+        )
+
+    value = current if current is not None else legacy
+    # Env override. LLM_SECOND_OPINION_TIMEOUT kept working for the same reason.
+    env_value = (
+        os.environ.get(f"{ENV_PREFIX}REQUEST_BUDGET")
+        or os.environ.get(f"{ENV_PREFIX}TIMEOUT")
+    )
+    if env_value:
+        value = env_value
+
+    if value is None:
+        return DEFAULT_REQUEST_BUDGET_SECONDS
+    try:
+        budget = float(value)
+    except (TypeError, ValueError) as e:
+        raise ConfigError(f"Invalid request_budget_seconds: {value!r}") from e
+    if budget <= 0:
+        raise ConfigError("request_budget_seconds must be > 0")
+    if budget >= BUDGET_WARN_THRESHOLD_SECONDS:
+        warnings.append(
+            f"request_budget_seconds={budget} leaves no room under the "
+            f"{CLIENT_HARD_CAP_SECONDS}s cap Claude Desktop enforces on tool "
+            f"calls; Desktop will cancel the call and discard the result "
+            f"before this budget fires. Use ~200 or lower."
+        )
+    return budget
+
+
+def _load_default_max_tokens(raw: dict) -> int | None:
+    """Reply cap used when the caller passes no `max_tokens`.
+
+    Explicit null in the file means 'leave replies unbounded' and is honoured;
+    only an absent key falls back to the default.
+    """
+    env_value = os.environ.get(f"{ENV_PREFIX}DEFAULT_MAX_TOKENS")
+    if env_value is not None:
+        if not env_value.strip() or env_value.strip().lower() in {"none", "null"}:
+            return None
+        value: object = env_value
+    elif "default_max_tokens" in raw:
+        value = raw["default_max_tokens"]
+    else:
+        return DEFAULT_MAX_TOKENS
+
+    if value is None:
+        return None
+    try:
+        tokens = int(value)
+    except (TypeError, ValueError) as e:
+        raise ConfigError(f"Invalid default_max_tokens: {value!r}") from e
+    if tokens <= 0:
+        raise ConfigError("default_max_tokens must be > 0, or null to disable")
+    return tokens

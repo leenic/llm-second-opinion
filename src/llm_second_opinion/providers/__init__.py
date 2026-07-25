@@ -38,11 +38,12 @@ def build_provider(target_model: str, config: AppConfig) -> Provider:
             retriable=False,
         )
 
-    timeout = config.timeout_seconds
+    # Same value as the handler's outer wait_for, so the socket closes rather
+    # than leaving a cancelled coroutine holding an open connection.
     kwargs = {
         "api_key": pcfg.api_key,
         "model": pcfg.model,
-        "timeout": timeout,
+        "timeout": config.request_budget_seconds,
         "reasoning_effort": pcfg.reasoning_effort,
         "web_search": pcfg.web_search,
     }

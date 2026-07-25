@@ -19,6 +19,7 @@
       "web_search": false
     }
   },
-  "timeout_seconds": 180,
+  "request_budget_seconds": 200,
+  "default_max_tokens": 8000,
   "log_prompts": false
 }
