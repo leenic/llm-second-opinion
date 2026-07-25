@@ -27,6 +27,11 @@ from .providers.gemini import GeminiProvider
 from .providers.grok import GrokProvider
 from .providers.openai_provider import OpenAIProvider
 
+# How long a cancelled provider task gets to tear down before we return
+# anyway. Kept small so `request_budget_seconds` + this still clears the MCP
+# client's hard cap (200 + 5 = 205, under 240).
+CANCEL_GRACE_SECONDS = 5.0
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are acting as an external reviewer for a conversation the user is "
     "having with another AI assistant. The user wants your independent view "
@@ -134,7 +139,7 @@ def build_server(config: AppConfig, logger: logging.Logger | None = None) -> Fas
             # adapter that ignores the arg) would otherwise run past Desktop's
             # 240s cap, which cancels the call and discards the result.
             #
-            response = await _run_bounded(provider.generate(req), budget)
+            response = await _run_bounded(provider.generate(req), budget, log)
         except (asyncio.TimeoutError, TimeoutError):
             took = elapsed_ms()
             log.warning(
@@ -220,7 +225,9 @@ def build_server(config: AppConfig, logger: logging.Logger | None = None) -> Fas
     return mcp
 
 
-async def _run_bounded(coro: Any, budget: float) -> Any:
+async def _run_bounded(
+    coro: Any, budget: float, log: logging.Logger | None = None
+) -> Any:
     """Run `coro` under a hard wall-clock bound, raising TimeoutError if it
     overruns.
 
@@ -229,25 +236,63 @@ async def _run_bounded(coro: Any, budget: float) -> Any:
     straight back and the deadline is silently ignored — a late answer would
     surface as a success well past the point the MCP client had given up. Here
     the result is discarded unconditionally once the deadline passes.
-
-    The cancelled task is awaited before returning so its teardown (closing the
-    HTTP connection) completes while we are still inside the handler, rather
-    than running loose afterwards.
     """
     task = asyncio.ensure_future(coro)
-    done, _pending = await asyncio.wait({task}, timeout=budget)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=budget)
+    except BaseException:
+        # We are being cancelled — client disconnected, or the server is
+        # shutting down. `task` has no other owner, so without this the
+        # upstream request keeps running unmanaged: a billable API call
+        # holding a socket that nothing will ever read.
+        #
+        # Cancel but deliberately do not await. Awaiting inside our own
+        # cancellation is how shutdowns wedge: if the loop is already tearing
+        # down, the continuation may never be scheduled. Cancelling is what
+        # stops the leak; teardown can finish on the loop's own time.
+        task.cancel()
+        raise
 
     if task in done:
         return task.result()  # re-raises ProviderError etc. to the caller
 
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass  # expected: the task honoured the cancel
-    except Exception:  # noqa: BLE001
-        pass  # teardown failed; irrelevant, the result is discarded either way
+    await _abandon(task, log)
     raise TimeoutError
+
+
+async def _abandon(task: asyncio.Task, log: logging.Logger | None = None) -> None:
+    """Cancel `task` and give it a bounded window to tear down.
+
+    Bounded, not open-ended: a coroutine that catches `CancelledError` and
+    keeps going would otherwise hold us here indefinitely and blow the very
+    budget this function exists to enforce. That is the same misbehaving
+    coroutine `_run_bounded` refuses to trust for its result, so we do not
+    trust it to exit either. The grace period is small enough that
+    budget + grace still clears the MCP client's hard cap.
+
+    Whatever the task produces is dropped either way — the caller has already
+    decided the deadline passed.
+    """
+    task.cancel()
+    _done, still_running = await asyncio.wait({task}, timeout=CANCEL_GRACE_SECONDS)
+
+    if still_running:
+        # Rare and worth seeing: a provider that ignores cancellation leaves a
+        # connection open behind us. We return regardless.
+        if log is not None:
+            log.warning(
+                "provider task ignored cancellation after %.1fs; abandoning it "
+                "(its result is discarded)",
+                CANCEL_GRACE_SECONDS,
+            )
+        return
+
+    # Retrieve the outcome so asyncio doesn't log "exception was never
+    # retrieved" when the task is garbage collected.
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        pass
 
 
 def _error_response(

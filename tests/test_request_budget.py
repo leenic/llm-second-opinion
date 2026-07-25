@@ -9,6 +9,8 @@ returns a structured error the calling model can act on instead.
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 
 import pytest
 
@@ -238,6 +240,133 @@ class TestDefaultMaxTokens:
         provider = StubProvider()
         await call_tool(provider, make_config(default_max_tokens=8000))(max_tokens=0)
         assert provider.requests[0].max_tokens == 0
+
+
+class TestUncooperativeProviders:
+    """`_run_bounded` exists because a coroutine may misbehave under
+    cancellation. It must not then trust that same coroutine to exit."""
+
+    @pytest.mark.asyncio
+    async def test_provider_that_ignores_cancellation_still_times_out(self, monkeypatch):
+        """Swallow the cancel and keep running: an unbounded teardown wait
+        would hold us here forever and blow the budget entirely."""
+        import llm_second_opinion.server as server_mod
+
+        monkeypatch.setattr(server_mod, "CANCEL_GRACE_SECONDS", 0.05)
+        entered = asyncio.Event()
+
+        async def stubborn():
+            entered.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(10)  # ignores the cancel and carries on
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await server_mod._run_bounded(stubborn(), budget=0.05)
+        took = time.monotonic() - started
+
+        assert entered.is_set()
+        assert took < 2.0, f"teardown was not bounded: {took:.2f}s"
+
+    @pytest.mark.asyncio
+    async def test_abandoned_task_is_logged(self, monkeypatch, caplog):
+        import llm_second_opinion.server as server_mod
+
+        monkeypatch.setattr(server_mod, "CANCEL_GRACE_SECONDS", 0.05)
+
+        async def stubborn():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                await asyncio.sleep(10)
+
+        log = logging.getLogger("test_abandon")
+        with caplog.at_level(logging.WARNING, logger="test_abandon"):
+            with pytest.raises(TimeoutError):
+                await server_mod._run_bounded(stubborn(), budget=0.05, log=log)
+
+        assert any("ignored cancellation" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_handler_timeout_still_returned_for_stubborn_provider(
+        self, call_tool, monkeypatch
+    ):
+        """End to end: the tool result is still a structured timeout."""
+        import llm_second_opinion.server as server_mod
+
+        monkeypatch.setattr(server_mod, "CANCEL_GRACE_SECONDS", 0.05)
+
+        class StubbornProvider(StubProvider):
+            async def generate(self, req):
+                self.started += 1
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(10)
+
+        result = await call_tool(StubbornProvider(), make_config(budget=0.05))()
+        assert result["success"] is False
+        assert result["error"]["type"] == "timeout"
+
+
+class TestOuterCancellation:
+    """If the MCP client disconnects or the server shuts down mid-call, the
+    upstream request must not keep running — it is billable and holds a
+    socket nothing will read."""
+
+    @pytest.mark.asyncio
+    async def test_provider_task_is_cancelled_when_the_handler_is_cancelled(self):
+        import llm_second_opinion.server as server_mod
+
+        entered = asyncio.Event()
+        observed = {"cancelled": False}
+
+        async def provider_call():
+            entered.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                observed["cancelled"] = True
+                raise
+
+        # A generous budget, so only the outer cancel can end this.
+        outer = asyncio.ensure_future(
+            server_mod._run_bounded(provider_call(), budget=30)
+        )
+        await entered.wait()
+        outer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await outer
+        await asyncio.sleep(0.05)  # let the cancellation reach the inner task
+
+        assert observed["cancelled"], "upstream call leaked past handler cancellation"
+
+    @pytest.mark.asyncio
+    async def test_no_task_survives_handler_cancellation(self):
+        import llm_second_opinion.server as server_mod
+
+        entered = asyncio.Event()
+
+        async def provider_call():
+            entered.set()
+            await asyncio.sleep(30)
+
+        outer = asyncio.ensure_future(
+            server_mod._run_bounded(provider_call(), budget=30)
+        )
+        await entered.wait()
+        outer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await outer
+        await asyncio.sleep(0.05)
+
+        leftover = [
+            t for t in asyncio.all_tasks()
+            if not t.done() and t is not asyncio.current_task()
+        ]
+        assert not leftover, f"leaked tasks: {leftover}"
 
 
 class TestStdoutIsReservedForTheTransport:
