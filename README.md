@@ -62,8 +62,37 @@ A provider with no key (or with the `REPLACE-ME` placeholder) is treated as unav
 | `providers.<name>.model` | Optional model name override for that provider |
 | `providers.<name>.reasoning_effort` | Optional. One of `minimal`, `low`, `medium`, `high`. Omit to use the provider's default thinking depth |
 | `providers.<name>.web_search` | Optional `true`/`false`. Attaches the provider's built-in web search tool to every call. Default `false` |
-| `timeout_seconds` | Per-request timeout to the upstream LLM (default 180). Reasoning-heavy flagships take tens of seconds end-to-end via the Responses/Interactions APIs because there is no streaming. Measured on a ~60-word review prompt with `web_search` on: `gemini-3.6-flash` ~17–19s (`high`), `gpt-5.6-sol` ~21s (`medium`), `grok-4.5` ~44–50s (`high`); the previous flagship `gpt-5.5` was measured at ~170s with `high` + `web_search`, so treat the low numbers here as current-model, current-prompt, not a ceiling. **MCP clients (e.g. Claude Desktop) cancel a tool call at ~240s regardless**, so keep this comfortably below that (≈200–210). Lower it if you want failures to surface faster; raise it (up to ~210) if you enable `web_search` on a flagship and see timeouts. The OpenAI/Grok client uses `max_retries=0` so this value bounds total wall-clock time — without that, SDK retries stack past the client's 240s cap and the call hangs with no result |
+| `request_budget_seconds` | Wall-clock bound on one whole tool call (default 200). See [Bounding call duration](#bounding-call-duration) below. Formerly `timeout_seconds`, which still works but warns |
+| `default_max_tokens` | Reply cap applied when the caller passes no `max_tokens` (default 8000). Set to `null` to leave replies unbounded. Long calls correlate with large reasoning+output token counts, so this is the main lever on tail latency |
 | `log_prompts` | If `true`, prompts and responses are written to the log. Off by default |
+
+#### Bounding call duration
+
+**Claude Desktop enforces a hard, non-configurable 240s cap on tool calls.** When it fires, Desktop cancels with `MCP error -32001: Request timed out` and the result is lost — even though the upstream call has often completed. `request_budget_seconds` exists to get in front of that: at the default 200 the server cancels the call itself and returns a normal tool result the calling model can act on:
+
+```json
+{
+  "success": false,
+  "request_id": "ab12cd34ef56",
+  "target_model": "grok",
+  "model": "grok-4.5",
+  "error": { "type": "timeout", "retriable": true, "message": "..." },
+  "elapsed_ms": 200009
+}
+```
+
+The same value is used for the provider's HTTP client timeout, so the socket is actually torn down rather than left open behind a cancelled coroutine. Keep it comfortably under 240 — the server warns at load if you set it at or above 235, and honours the value anyway in case your MCP client allows longer.
+
+This is a tail-latency guard, not a throughput fix. Measured on a ~60-word review prompt with `web_search` on: `gemini-3.6-flash` ~17–19s (`high`), `gpt-5.6-sol` ~21s (`medium`), `grok-4.5` ~44–50s (`high`). A long, open-ended review prompt pushes `gpt-5.6-sol` past 80s. The OpenAI/Grok client also uses `max_retries=0` so SDK retries can't stack past the budget.
+
+Every call logs `provider`, `outcome` and `elapsed_ms` to stderr, so the latency distribution stays measurable from the Desktop log:
+
+```
+rid=f55cb0b43b57 tool=second_opinion provider=grok model=grok-4.5 outcome=timeout elapsed_ms=200009 budget_s=200.0
+rid=9e2ad9387f41 tool=second_opinion provider=gemini model=gemini-3.6-flash outcome=ok latency_ms=3931 elapsed_ms=3964 ...
+```
+
+All logging goes to stderr. stdout carries the JSON-RPC transport and nothing else.
 
 #### How `reasoning_effort` is applied per provider
 
