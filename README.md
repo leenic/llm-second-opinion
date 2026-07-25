@@ -11,17 +11,17 @@ A local MCP server that exposes a `second_opinion` tool. When Claude calls it, t
 
 Each call is single-turn. No conversation history is forwarded to the external model.
 
-### Provider interfaces (as of 13 May 2026)
+### Provider interfaces (as of 25 July 2026)
 
 | Provider | Interface | Default model | SDK |
 |---|---|---|---|
-| ChatGPT (OpenAI) | Responses API (`client.responses.create`) | `gpt-5.5` | `openai>=2.36` |
-| Gemini (Google) | Interactions API (`client.aio.interactions.create`) | `gemini-3.1-pro-preview` | `google-genai>=2.0` |
-| Grok (xAI) | Responses API via OpenAI-compatible base URL (`https://api.x.ai/v1`) | `grok-4.3` | `openai>=2.36` |
+| ChatGPT (OpenAI) | Responses API (`client.responses.create`) | `gpt-5.6-sol` | `openai>=2.36` |
+| Gemini (Google) | Interactions API (`client.aio.interactions.create`) | `gemini-3.6-flash` | `google-genai>=2.0` |
+| Grok (xAI) | Responses API via OpenAI-compatible base URL (`https://api.x.ai/v1`) | `grok-4.5` | `openai>=2.36` |
 
 These are the stateful/agentic-first interfaces each provider now recommends for new integrations. We call them in single-turn mode (no `previous_response_id`, no Interactions session state) because v1 of this server forwards no conversation history.
 
-**Note:** xAI is retiring Grok-3 and several early Grok-4 variants on **15 May 2026**. The default `grok-4.3` is the current flagship — override with `LLM_SECOND_OPINION_GROK_MODEL` if you need a different variant.
+**Note:** `gpt-5.6-sol` is reasoning-only and rejects `temperature` outright (`400 Unsupported parameter`) rather than ignoring it; `grok-4.5` and `gemini-3.6-flash` both accept it. You don't need to track which is which — if a model rejects an advisory sampling parameter, the Responses provider drops it and retries once, logging a warning. Sampling knobs only (`temperature`, `top_p`); `max_output_tokens` is never dropped, because silently removing a length cap would change cost and truncation. Override any default with `LLM_SECOND_OPINION_<PROVIDER>_MODEL`.
 
 ## Install
 
@@ -62,7 +62,7 @@ A provider with no key (or with the `REPLACE-ME` placeholder) is treated as unav
 | `providers.<name>.model` | Optional model name override for that provider |
 | `providers.<name>.reasoning_effort` | Optional. One of `minimal`, `low`, `medium`, `high`. Omit to use the provider's default thinking depth |
 | `providers.<name>.web_search` | Optional `true`/`false`. Attaches the provider's built-in web search tool to every call. Default `false` |
-| `timeout_seconds` | Per-request timeout to the upstream LLM (default 180). Reasoning-heavy flagships (gpt-5.5, gemini-3.1-pro, grok-4.3) take 30s–170s+ end-to-end via the Responses/Interactions APIs because there is no streaming — `high` reasoning + `web_search` on gpt-5.5 has been measured at ~170s. **MCP clients (e.g. Claude Desktop) cancel a tool call at ~240s regardless**, so keep this comfortably below that (≈200–210). Lower it if you want failures to surface faster; raise it (up to ~210) if you enable `web_search` on a flagship and see timeouts. The OpenAI/Grok client uses `max_retries=0` so this value bounds total wall-clock time — without that, SDK retries stack past the client's 240s cap and the call hangs with no result |
+| `timeout_seconds` | Per-request timeout to the upstream LLM (default 180). Reasoning-heavy flagships take tens of seconds end-to-end via the Responses/Interactions APIs because there is no streaming. Measured on a ~60-word review prompt with `web_search` on: `gemini-3.6-flash` ~17–19s (`high`), `gpt-5.6-sol` ~21s (`medium`), `grok-4.5` ~44–50s (`high`); the previous flagship `gpt-5.5` was measured at ~170s with `high` + `web_search`, so treat the low numbers here as current-model, current-prompt, not a ceiling. **MCP clients (e.g. Claude Desktop) cancel a tool call at ~240s regardless**, so keep this comfortably below that (≈200–210). Lower it if you want failures to surface faster; raise it (up to ~210) if you enable `web_search` on a flagship and see timeouts. The OpenAI/Grok client uses `max_retries=0` so this value bounds total wall-clock time — without that, SDK retries stack past the client's 240s cap and the call hangs with no result |
 | `log_prompts` | If `true`, prompts and responses are written to the log. Off by default |
 
 #### How `reasoning_effort` is applied per provider
@@ -166,7 +166,7 @@ Successful response:
   "request_id": "ab12cd34ef56",
   "target_model": "gemini",
   "provider": "gemini",
-  "model": "gemini-3.1-pro-preview-2026-05",
+  "model": "gemini-3.6-flash",
   "response": "...",
   "usage": { "input_tokens": 123, "output_tokens": 456, "total_tokens": 579 },
   "latency_ms": 1840

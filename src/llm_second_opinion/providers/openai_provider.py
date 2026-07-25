@@ -6,6 +6,8 @@ via the OpenAI-compatible endpoint — see grok.py.
 
 from __future__ import annotations
 
+import logging
+import re
 import time
 from typing import Any
 
@@ -28,6 +30,19 @@ from .base import (
     SecondOpinionResponse,
     TokenUsage,
 )
+
+log = logging.getLogger(__name__)
+
+# Sampling knobs we can drop and still answer the user's actual question.
+# Reasoning-only models reject these outright rather than ignoring them:
+# gpt-5.6-sol returns `400 Unsupported parameter: 'temperature' is not
+# supported with this model.` Deliberately excludes `max_output_tokens` — a
+# length cap bounds cost and truncation, so silently dropping it could return
+# a far longer and more expensive reply than the caller asked for. Better to
+# surface that as an error.
+DROPPABLE_PARAMS = frozenset({"temperature", "top_p"})
+
+_UNSUPPORTED_PARAM_RE = re.compile(r"[Uu]nsupported parameter: '([^']+)'")
 
 
 class ResponsesAPIProvider(Provider):
@@ -73,7 +88,7 @@ class ResponsesAPIProvider(Provider):
             kwargs["base_url"] = self.base_url
         return AsyncOpenAI(**kwargs)
 
-    async def generate(self, req: SecondOpinionRequest) -> SecondOpinionResponse:
+    def _build_kwargs(self, req: SecondOpinionRequest) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "input": self.build_user_content(req),
@@ -88,11 +103,50 @@ class ResponsesAPIProvider(Provider):
             kwargs["reasoning"] = {"effort": self.reasoning_effort}
         if self.web_search:
             kwargs["tools"] = [{"type": "web_search"}]
+        return kwargs
+
+    async def generate(self, req: SecondOpinionRequest) -> SecondOpinionResponse:
+        kwargs = self._build_kwargs(req)
+        client = self._client()
 
         start = time.monotonic()
         try:
-            client = self._client()
-            response = await client.responses.create(**kwargs)
+            response = await self._create(client, kwargs)
+        except ProviderError as e:
+            # A reasoning-only model rejects sampling knobs instead of ignoring
+            # them, failing the whole call over a parameter that was only ever
+            # advisory. Drop the offending one and ask again rather than
+            # spending the user's round-trip on a 400. Retried at most once:
+            # we only ever send one droppable param, and a second rejection
+            # means something we can't paper over.
+            dropped = _droppable_unsupported_param(e, kwargs)
+            if dropped is None:
+                raise
+            # The retry must fit inside the *original* deadline. `self.timeout`
+            # is bound to the client at construction, so a second `_create`
+            # would silently get a fresh full budget and let one tool call run
+            # up to 2x `timeout_seconds` — past the MCP client's ~240s cap,
+            # which is the exact failure `max_retries=0` above exists to
+            # prevent. Charge the retry only what's left.
+            remaining = self.timeout - (time.monotonic() - start)
+            if remaining <= 0:
+                raise
+            log.warning(
+                "%s model=%s rejected %r; retrying without it (%.1fs left)",
+                self.name, self.model, dropped, remaining,
+            )
+            kwargs.pop(dropped)
+            response = await self._create(
+                client.with_options(timeout=remaining), kwargs
+            )
+
+        latency_ms = int((time.monotonic() - start) * 1000)
+        return self._build_response(response, latency_ms)
+
+    async def _create(self, client: AsyncOpenAI, kwargs: dict[str, Any]) -> Any:
+        """One call to the Responses API, with SDK errors mapped to ProviderError."""
+        try:
+            return await client.responses.create(**kwargs)
         except APITimeoutError as e:
             raise ProviderError(
                 "timeout",
@@ -126,8 +180,8 @@ class ResponsesAPIProvider(Provider):
             raise ProviderError("upstream_error", f"{self.name} error ({status}): {e}",
                                 retriable=False, status=status) from e
 
-        latency_ms = int((time.monotonic() - start) * 1000)
-
+    def _build_response(self, response: Any, latency_ms: int) -> SecondOpinionResponse:
+        """Validate a completed Responses payload and extract the final answer."""
         usage = _extract_usage(response)
         status = getattr(response, "status", None)
         incomplete = getattr(response, "incomplete_details", None)
@@ -160,7 +214,8 @@ class ResponsesAPIProvider(Provider):
                 retriable=True,
             )
 
-        text = (getattr(response, "output_text", None) or "").strip()
+        # Deliberately not `response.output_text` — see _final_message_text.
+        text = _final_message_text(response).strip()
         if not text:
             refusal = _extract_refusal(response)
             if refusal:
@@ -169,9 +224,6 @@ class ResponsesAPIProvider(Provider):
                     f"{self.name} refused the request: {refusal}",
                     retriable=False,
                 )
-            # `output_text` is the concatenation of message-type items only;
-            # if it's empty, try walking the full output list once more.
-            text = _join_output_text(response).strip()
 
         if not text:
             # status was 'completed' but no visible text — usually means the
@@ -215,6 +267,28 @@ class ResponsesAPIProvider(Provider):
         return True, None
 
 
+def _droppable_unsupported_param(
+    error: ProviderError, kwargs: dict[str, Any]
+) -> str | None:
+    """Name of the sampling param this error blames, if we can safely drop it.
+
+    Returns None — meaning "let the error propagate" — unless all of:
+    the failure was a 400, the message names a parameter, that parameter is
+    one we consider advisory (`DROPPABLE_PARAMS`), and we actually sent it.
+    The last check matters: retrying without a param we never sent would just
+    replay the identical request and burn a second round-trip.
+    """
+    if error.error_type != "bad_request":
+        return None
+    match = _UNSUPPORTED_PARAM_RE.search(error.message)
+    if not match:
+        return None
+    name = match.group(1)
+    if name not in DROPPABLE_PARAMS or name not in kwargs:
+        return None
+    return name
+
+
 def _extract_usage(response: Any) -> TokenUsage | None:
     usage = getattr(response, "usage", None)
     if usage is None:
@@ -243,18 +317,42 @@ def _extract_refusal(response: Any) -> str | None:
     return None
 
 
-def _join_output_text(response: Any) -> str:
+def _final_message_text(response: Any) -> str:
+    """Return only the model's final answer from `response.output`.
+
+    We can't use `response.output_text`: it concatenates the text of *every*
+    message item in the timeline. A reasoning model that narrates before
+    calling a tool emits those asides as ordinary message items, so
+    `output_text` glues them onto the front of the real answer with no
+    separator — e.g. "I need current best practices...**Do not store 30-day
+    tokens...". Measured on grok-4.5 + web_search at roughly half of runs
+    (message items at output indices [1, 8, 19]); gpt-5.6-sol did not do it,
+    but the shape is model behaviour, not provider behaviour.
+
+    So we walk the timeline backwards and keep only the trailing run of
+    message items, stopping at the first non-message item — a reasoning step
+    or a tool call marks the boundary of the final turn. Leading non-message
+    items are skipped so a trailing reasoning item can't hide the answer.
+    Mirrors `gemini._join_output_text`, which solves the same problem on the
+    Interactions API `steps` timeline.
+    """
     parts: list[str] = []
-    output = getattr(response, "output", None) or []
-    for item in output:
+    collecting = False
+    for item in reversed(getattr(response, "output", None) or []):
         if getattr(item, "type", None) != "message":
+            if collecting:
+                break
             continue
-        content = getattr(item, "content", None) or []
-        for c in content:
+        chunk: list[str] = []
+        for c in getattr(item, "content", None) or []:
             if getattr(c, "type", None) == "output_text":
                 t = getattr(c, "text", None)
                 if t:
-                    parts.append(t)
+                    chunk.append(t)
+        if chunk:
+            collecting = True
+            parts.append("".join(chunk))
+    parts.reverse()
     return "".join(parts)
 
 

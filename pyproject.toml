@@ -27,3 +27,8 @@ llm-second-opinion = "llm_second_opinion.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/llm_second_opinion"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"

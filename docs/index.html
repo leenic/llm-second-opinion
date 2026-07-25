@@ -364,9 +364,9 @@
         <tr><th>Target</th><th>Provider &amp; interface</th><th>Default model</th><th>SDK</th></tr>
       </thead>
       <tbody>
-        <tr><td class="pname">chatgpt</td><td>OpenAI — Responses API</td><td><code>gpt-5.5</code></td><td><code>openai ≥ 2.36</code></td></tr>
-        <tr><td class="pname">gemini</td><td>Google — Interactions API</td><td><code>gemini-3.1-pro-preview</code></td><td><code>google-genai ≥ 1.55</code></td></tr>
-        <tr><td class="pname">grok</td><td>xAI — OpenAI-compatible Responses API</td><td><code>grok-4.3</code></td><td><code>openai ≥ 2.36</code></td></tr>
+        <tr><td class="pname">chatgpt</td><td>OpenAI — Responses API</td><td><code>gpt-5.6-sol</code></td><td><code>openai ≥ 2.36</code></td></tr>
+        <tr><td class="pname">gemini</td><td>Google — Interactions API</td><td><code>gemini-3.6-flash</code></td><td><code>google-genai ≥ 2.0</code></td></tr>
+        <tr><td class="pname">grok</td><td>xAI — OpenAI-compatible Responses API</td><td><code>grok-4.5</code></td><td><code>openai ≥ 2.36</code></td></tr>
       </tbody>
     </table>
 
@@ -516,17 +516,17 @@ notepad config.json   <span class="c"># add the keys you have</span></pre>
 
     { t: 'user', text: "Get a second opinion from Gemini." },
     { t: 'tool', model: 'gemini' },
-    { t: 'opinion', cls: 'gemini', name: 'Gemini · 3.1 Pro', tag: 'web_search', html: "Weight <b>cross-platform + voice</b>: <b>Google Keep</b> and <b>Todoist</b> have the fastest Android capture, and <b>TickTick</b>'s home-screen quick-ball is excellent. Note that Things 3 and Drafts are <b>iOS / Mac-only</b> — a real constraint if you ever switch devices." },
+    { t: 'opinion', cls: 'gemini', name: 'Gemini · 3.6 Flash', tag: 'web_search', html: "Weight <b>cross-platform + voice</b>: <b>Google Keep</b> and <b>Todoist</b> have the fastest Android capture, and <b>TickTick</b>'s home-screen quick-ball is excellent. Note that Things 3 and Drafts are <b>iOS / Mac-only</b> — a real constraint if you ever switch devices." },
     { t: 'claude', text: "Gemini flags that my list skewed Apple-only. <b>Revised:</b> if you're cross-platform, lead with <b>Todoist</b>, <b>TickTick</b>, or <b>Google Keep</b> (voice + widget capture); keep <b>Drafts</b> and <b>Things 3</b> only if you're all-Apple." },
 
     { t: 'user', text: "Have ChatGPT suggest any that are missing." },
     { t: 'tool', model: 'chatgpt' },
-    { t: 'opinion', cls: 'gpt', name: 'ChatGPT · gpt-5.5', tag: 'web_search', html: "Two gaps: <b>Apple Reminders</b> deserves top billing for Apple users — lock-screen + “Hey Siri, remind me…” is zero-friction. And <b>Microsoft To Do</b> is the natural pick inside a Microsoft 365 / Windows workflow. For text-first users, <b>Drafts</b> plus a share-sheet shortcut is still the fastest path." },
+    { t: 'opinion', cls: 'gpt', name: 'ChatGPT · gpt-5.6-sol', tag: 'web_search', html: "Two gaps: <b>Apple Reminders</b> deserves top billing for Apple users — lock-screen + “Hey Siri, remind me…” is zero-friction. And <b>Microsoft To Do</b> is the natural pick inside a Microsoft 365 / Windows workflow. For text-first users, <b>Drafts</b> plus a share-sheet shortcut is still the fastest path." },
     { t: 'claude', text: "Folding those in: <b>Apple Reminders</b> moves back near the top for Apple users, and <b>Microsoft To Do</b> covers Windows / 365. Working list is now Todoist, TickTick, Google Keep, Apple Reminders, Microsoft To Do, and Drafts — grouped by ecosystem." },
 
     { t: 'user', text: "Get Grok to cross-check the list." },
     { t: 'tool', model: 'grok' },
-    { t: 'opinion', cls: 'grok', name: 'Grok · 4.3', tag: 'web_search', html: "No bad picks, but you're tuning the wrong layer: the <b>capture trigger beats the app</b>. Whatever you choose, bind a global hotkey / Siri / a single home-screen widget — that's where friction actually lives. One caution: a fast app you can't trust to sync is worse than a plain note that does, so weight <b>sync reliability</b> too." },
+    { t: 'opinion', cls: 'grok', name: 'Grok · 4.5', tag: 'web_search', html: "No bad picks, but you're tuning the wrong layer: the <b>capture trigger beats the app</b>. Whatever you choose, bind a global hotkey / Siri / a single home-screen widget — that's where friction actually lives. One caution: a fast app you can't trust to sync is worse than a plain note that does, so weight <b>sync reliability</b> too." },
     { t: 'claude', text: "Grok cross-checks clean — same picks, sharper framing. <b>Final take:</b> choose by ecosystem (<b>Apple Reminders</b> / <b>Drafts</b> on Apple; <b>Todoist</b> / <b>TickTick</b> / <b>Google Keep</b> cross-platform; <b>Microsoft To Do</b> on Windows), then invest in the <b>capture trigger</b> — hotkey, Siri, or one widget — and confirm sync is rock-solid. That ordering matters more than the specific app." }
   ];
 
