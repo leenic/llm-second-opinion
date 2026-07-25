@@ -160,7 +160,8 @@ class ResponsesAPIProvider(Provider):
                 retriable=True,
             )
 
-        text = (getattr(response, "output_text", None) or "").strip()
+        # Deliberately not `response.output_text` — see _final_message_text.
+        text = _final_message_text(response).strip()
         if not text:
             refusal = _extract_refusal(response)
             if refusal:
@@ -169,9 +170,6 @@ class ResponsesAPIProvider(Provider):
                     f"{self.name} refused the request: {refusal}",
                     retriable=False,
                 )
-            # `output_text` is the concatenation of message-type items only;
-            # if it's empty, try walking the full output list once more.
-            text = _join_output_text(response).strip()
 
         if not text:
             # status was 'completed' but no visible text — usually means the
@@ -243,18 +241,42 @@ def _extract_refusal(response: Any) -> str | None:
     return None
 
 
-def _join_output_text(response: Any) -> str:
+def _final_message_text(response: Any) -> str:
+    """Return only the model's final answer from `response.output`.
+
+    We can't use `response.output_text`: it concatenates the text of *every*
+    message item in the timeline. A reasoning model that narrates before
+    calling a tool emits those asides as ordinary message items, so
+    `output_text` glues them onto the front of the real answer with no
+    separator — e.g. "I need current best practices...**Do not store 30-day
+    tokens...". Measured on grok-4.5 + web_search at roughly half of runs
+    (message items at output indices [1, 8, 19]); gpt-5.6-sol did not do it,
+    but the shape is model behaviour, not provider behaviour.
+
+    So we walk the timeline backwards and keep only the trailing run of
+    message items, stopping at the first non-message item — a reasoning step
+    or a tool call marks the boundary of the final turn. Leading non-message
+    items are skipped so a trailing reasoning item can't hide the answer.
+    Mirrors `gemini._join_output_text`, which solves the same problem on the
+    Interactions API `steps` timeline.
+    """
     parts: list[str] = []
-    output = getattr(response, "output", None) or []
-    for item in output:
+    collecting = False
+    for item in reversed(getattr(response, "output", None) or []):
         if getattr(item, "type", None) != "message":
+            if collecting:
+                break
             continue
-        content = getattr(item, "content", None) or []
-        for c in content:
+        chunk: list[str] = []
+        for c in getattr(item, "content", None) or []:
             if getattr(c, "type", None) == "output_text":
                 t = getattr(c, "text", None)
                 if t:
-                    parts.append(t)
+                    chunk.append(t)
+        if chunk:
+            collecting = True
+            parts.append("".join(chunk))
+    parts.reverse()
     return "".join(parts)
 
 
