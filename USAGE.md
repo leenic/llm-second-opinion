@@ -56,7 +56,7 @@ When you ask Claude to call the tool, you can shape the call by mentioning these
 
 - **`focus`** — narrow the reviewer's attention. *"…focus on whether the rollback plan is realistic."*
 - **`system_prompt`** — replace the default reviewer persona. The default tells the external model to be direct, critical, and skip the praise. Override it only when you want a different kind of feedback (e.g., *"…use system_prompt: 'you are a hostile pentest reviewer'"*).
-- **`temperature`** — pass a number if you want it more deterministic (0–0.3) or more creative (0.8+). Most flagships ignore this for reasoning tracks anyway. **`gpt-5.6-sol` does not ignore it — it rejects the whole call with `bad_request`.** Only send `temperature` to `grok` or `gemini`; if a ChatGPT call fails this way, retry without it.
+- **`temperature`** — pass a number if you want it more deterministic (0–0.3) or more creative (0.8+). Most flagships ignore this for reasoning tracks anyway, and `gpt-5.6-sol` rejects it outright — but you can pass it to any model regardless: if the model refuses it, the server drops it and retries automatically, so you get an answer rather than an error. The trade-off is that the reply then uses the model's own default sampling, and the call takes one extra round-trip.
 - **`max_tokens`** — cap the length of the reply. Useful when you only want a quick verdict.
 
 You don't need to remember the arg names — say what you want and Claude will map it.
@@ -111,7 +111,7 @@ Common `error.type` values you might see:
 | `rate_limit` | Wait a bit, or switch to a different `target_model`. |
 | `timeout` | Network or upstream slow — retry, or raise `timeout_seconds`. |
 | `content_blocked` | The provider's safety filter rejected the prompt or response. Try a different model or rephrase. |
-| `bad_request` | Usually a model name typo or a parameter the model didn't accept (e.g. `temperature` on a reasoning-only model). |
+| `bad_request` | Usually a model name typo, or a parameter the model didn't accept. `temperature` no longer lands here — it's dropped and retried automatically. |
 
 ## Tips that pay off
 

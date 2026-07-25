@@ -83,6 +83,24 @@ def responses_result(
     )
 
 
+def bad_request(message: str) -> Exception:
+    """A real `openai.BadRequestError`, so the provider's except-chain is
+    exercised exactly as it would be against the live API."""
+    import httpx
+    from openai import BadRequestError
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    return BadRequestError(
+        message, response=httpx.Response(400, request=request), body=None
+    )
+
+
+# Verbatim from a live gpt-5.6-sol call.
+UNSUPPORTED_TEMPERATURE = (
+    "Unsupported parameter: 'temperature' is not supported with this model."
+)
+
+
 @pytest.fixture
 def make_provider():
     """Build a provider whose HTTP client is replaced by a stub.
@@ -92,16 +110,21 @@ def make_provider():
     """
 
     def _make(result: Any, cls=None, **provider_kwargs):
+        """`result` is a response, an Exception to raise, or a list of either
+        to be served one per call (for retry paths)."""
         from llm_second_opinion.providers.openai_provider import OpenAIProvider
 
         cls = cls or OpenAIProvider
         calls: list[dict] = []
+        queue = list(result) if isinstance(result, list) else None
 
         async def _create(**kwargs):
-            calls.append(kwargs)
-            if isinstance(result, Exception):
-                raise result
-            return result
+            # Copy: the provider mutates its kwargs dict between attempts.
+            calls.append(dict(kwargs))
+            outcome = queue.pop(0) if queue is not None else result
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
 
         kwargs = {"api_key": "test-key", "model": "test-model", "timeout": 30.0}
         kwargs.update(provider_kwargs)

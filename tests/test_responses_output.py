@@ -19,6 +19,8 @@ from llm_second_opinion.providers.openai_provider import (
 )
 
 from conftest import (
+    UNSUPPORTED_TEMPERATURE,
+    bad_request,
     message,
     reasoning,
     refusal_block,
@@ -211,6 +213,154 @@ class TestRequestShape:
     def test_grok_targets_the_xai_base_url(self):
         assert GrokProvider.base_url == "https://api.x.ai/v1"
         assert OpenAIProvider.base_url is None
+
+
+class TestUnsupportedParamRetry:
+    """gpt-5.6-sol rejects `temperature` outright instead of ignoring it.
+
+    Failing the whole call over an advisory sampling knob costs the user a
+    round-trip, so we drop the offending param and ask once more.
+    """
+
+    @pytest.mark.asyncio
+    async def test_temperature_rejection_is_retried_without_it(
+        self, make_provider, request_factory
+    ):
+        provider, calls = make_provider(
+            [bad_request(UNSUPPORTED_TEMPERATURE), responses_result(text_message(ANSWER))]
+        )
+        resp = await provider.generate(request_factory(temperature=0.2, max_tokens=500))
+
+        assert resp.text == ANSWER
+        assert len(calls) == 2
+        assert calls[0]["temperature"] == 0.2
+        assert "temperature" not in calls[1]
+        # Everything else must survive the retry unchanged.
+        assert calls[1]["max_output_tokens"] == 500
+        assert calls[1]["input"] == calls[0]["input"]
+        assert calls[1]["instructions"] == calls[0]["instructions"]
+
+    @pytest.mark.asyncio
+    async def test_latency_covers_both_attempts(self, make_provider, request_factory):
+        provider, _ = make_provider(
+            [bad_request(UNSUPPORTED_TEMPERATURE), responses_result(text_message(ANSWER))]
+        )
+        resp = await provider.generate(request_factory(temperature=0.2))
+        assert resp.latency_ms >= 0  # measured across the retry, not reset
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_temperature_was_not_sent(
+        self, make_provider, request_factory
+    ):
+        """Retrying an identical request would just burn a second round-trip."""
+        provider, calls = make_provider(bad_request(UNSUPPORTED_TEMPERATURE))
+        with pytest.raises(ProviderError) as exc:
+            await provider.generate(request_factory())
+
+        assert exc.value.error_type == "bad_request"
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_unrelated_bad_request_is_not_retried(
+        self, make_provider, request_factory
+    ):
+        provider, calls = make_provider(bad_request("Invalid value for 'input'."))
+        with pytest.raises(ProviderError) as exc:
+            await provider.generate(request_factory(temperature=0.2))
+
+        assert exc.value.error_type == "bad_request"
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_max_output_tokens_is_never_dropped(
+        self, make_provider, request_factory
+    ):
+        """Dropping a length cap would change cost and truncation behaviour,
+        so it must surface as an error rather than being papered over."""
+        provider, calls = make_provider(
+            bad_request("Unsupported parameter: 'max_output_tokens' is not supported.")
+        )
+        with pytest.raises(ProviderError):
+            await provider.generate(request_factory(max_tokens=500))
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_second_rejection_propagates(self, make_provider, request_factory):
+        """At most one retry — no unbounded strip-and-retry loop."""
+        provider, calls = make_provider(
+            [
+                bad_request(UNSUPPORTED_TEMPERATURE),
+                bad_request("Unsupported parameter: 'top_p' is not supported."),
+            ]
+        )
+        with pytest.raises(ProviderError) as exc:
+            await provider.generate(request_factory(temperature=0.2))
+
+        assert "top_p" in exc.value.message
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_non_bad_request_errors_are_untouched(
+        self, make_provider, request_factory
+    ):
+        """A rate limit must stay retriable, not get swallowed by the retry."""
+        from openai import RateLimitError
+        import httpx
+
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        err = RateLimitError(
+            "slow down", response=httpx.Response(429, request=request), body=None
+        )
+        provider, calls = make_provider(err)
+        with pytest.raises(ProviderError) as exc:
+            await provider.generate(request_factory(temperature=0.2))
+
+        assert exc.value.error_type == "rate_limit"
+        assert exc.value.retriable is True
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_grok_keeps_temperature_when_accepted(
+        self, make_provider, request_factory
+    ):
+        """grok-4.5 and gemini-3.6-flash accept temperature — no retry, and
+        the value must actually reach the API."""
+        provider, calls = make_provider(
+            responses_result(text_message(ANSWER)), cls=GrokProvider
+        )
+        await provider.generate(request_factory(temperature=0.2))
+
+        assert len(calls) == 1
+        assert calls[0]["temperature"] == 0.2
+
+
+class TestDroppableParamHelper:
+    @pytest.mark.parametrize(
+        "message,sent,expected",
+        [
+            (UNSUPPORTED_TEMPERATURE, {"temperature": 0.2}, "temperature"),
+            ("unsupported parameter: 'temperature' bla", {"temperature": 0}, "temperature"),
+            (UNSUPPORTED_TEMPERATURE, {}, None),
+            ("Unsupported parameter: 'max_output_tokens'.", {"max_output_tokens": 5}, None),
+            ("Unsupported parameter: 'reasoning'.", {"reasoning": {}}, None),
+            ("something else entirely", {"temperature": 0.2}, None),
+        ],
+    )
+    def test_matching(self, message, sent, expected):
+        from llm_second_opinion.providers.openai_provider import (
+            _droppable_unsupported_param,
+        )
+
+        err = ProviderError("bad_request", message)
+        assert _droppable_unsupported_param(err, sent) == expected
+
+    def test_only_bad_request_qualifies(self):
+        from llm_second_opinion.providers.openai_provider import (
+            _droppable_unsupported_param,
+        )
+
+        err = ProviderError("upstream_error", UNSUPPORTED_TEMPERATURE)
+        assert _droppable_unsupported_param(err, {"temperature": 0.2}) is None
 
 
 class TestTerminalStatuses:

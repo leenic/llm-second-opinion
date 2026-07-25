@@ -21,7 +21,7 @@ Each call is single-turn. No conversation history is forwarded to the external m
 
 These are the stateful/agentic-first interfaces each provider now recommends for new integrations. We call them in single-turn mode (no `previous_response_id`, no Interactions session state) because v1 of this server forwards no conversation history.
 
-**Note:** `gpt-5.6-sol` rejects `temperature` outright (`400 Unsupported parameter`) — it is reasoning-only. `grok-4.5` and `gemini-3.6-flash` both accept it. Pass `temperature` only when you know the target model supports it. Override any default with `LLM_SECOND_OPINION_<PROVIDER>_MODEL`.
+**Note:** `gpt-5.6-sol` is reasoning-only and rejects `temperature` outright (`400 Unsupported parameter`) rather than ignoring it; `grok-4.5` and `gemini-3.6-flash` both accept it. You don't need to track which is which — if a model rejects an advisory sampling parameter, the Responses provider drops it and retries once, logging a warning. Sampling knobs only (`temperature`, `top_p`); `max_output_tokens` is never dropped, because silently removing a length cap would change cost and truncation. Override any default with `LLM_SECOND_OPINION_<PROVIDER>_MODEL`.
 
 ## Install
 

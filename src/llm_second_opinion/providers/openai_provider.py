@@ -6,6 +6,8 @@ via the OpenAI-compatible endpoint — see grok.py.
 
 from __future__ import annotations
 
+import logging
+import re
 import time
 from typing import Any
 
@@ -28,6 +30,19 @@ from .base import (
     SecondOpinionResponse,
     TokenUsage,
 )
+
+log = logging.getLogger(__name__)
+
+# Sampling knobs we can drop and still answer the user's actual question.
+# Reasoning-only models reject these outright rather than ignoring them:
+# gpt-5.6-sol returns `400 Unsupported parameter: 'temperature' is not
+# supported with this model.` Deliberately excludes `max_output_tokens` — a
+# length cap bounds cost and truncation, so silently dropping it could return
+# a far longer and more expensive reply than the caller asked for. Better to
+# surface that as an error.
+DROPPABLE_PARAMS = frozenset({"temperature", "top_p"})
+
+_UNSUPPORTED_PARAM_RE = re.compile(r"[Uu]nsupported parameter: '([^']+)'")
 
 
 class ResponsesAPIProvider(Provider):
@@ -73,7 +88,7 @@ class ResponsesAPIProvider(Provider):
             kwargs["base_url"] = self.base_url
         return AsyncOpenAI(**kwargs)
 
-    async def generate(self, req: SecondOpinionRequest) -> SecondOpinionResponse:
+    def _build_kwargs(self, req: SecondOpinionRequest) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "input": self.build_user_content(req),
@@ -88,11 +103,39 @@ class ResponsesAPIProvider(Provider):
             kwargs["reasoning"] = {"effort": self.reasoning_effort}
         if self.web_search:
             kwargs["tools"] = [{"type": "web_search"}]
+        return kwargs
+
+    async def generate(self, req: SecondOpinionRequest) -> SecondOpinionResponse:
+        kwargs = self._build_kwargs(req)
+        client = self._client()
 
         start = time.monotonic()
         try:
-            client = self._client()
-            response = await client.responses.create(**kwargs)
+            response = await self._create(client, kwargs)
+        except ProviderError as e:
+            # A reasoning-only model rejects sampling knobs instead of ignoring
+            # them, failing the whole call over a parameter that was only ever
+            # advisory. Drop the offending one and ask again rather than
+            # spending the user's round-trip on a 400. Retried at most once:
+            # we only ever send one droppable param, and a second rejection
+            # means something we can't paper over.
+            dropped = _droppable_unsupported_param(e, kwargs)
+            if dropped is None:
+                raise
+            log.warning(
+                "%s model=%s rejected %r; retrying without it",
+                self.name, self.model, dropped,
+            )
+            kwargs.pop(dropped)
+            response = await self._create(client, kwargs)
+
+        latency_ms = int((time.monotonic() - start) * 1000)
+        return self._build_response(response, latency_ms)
+
+    async def _create(self, client: AsyncOpenAI, kwargs: dict[str, Any]) -> Any:
+        """One call to the Responses API, with SDK errors mapped to ProviderError."""
+        try:
+            return await client.responses.create(**kwargs)
         except APITimeoutError as e:
             raise ProviderError(
                 "timeout",
@@ -126,8 +169,8 @@ class ResponsesAPIProvider(Provider):
             raise ProviderError("upstream_error", f"{self.name} error ({status}): {e}",
                                 retriable=False, status=status) from e
 
-        latency_ms = int((time.monotonic() - start) * 1000)
-
+    def _build_response(self, response: Any, latency_ms: int) -> SecondOpinionResponse:
+        """Validate a completed Responses payload and extract the final answer."""
         usage = _extract_usage(response)
         status = getattr(response, "status", None)
         incomplete = getattr(response, "incomplete_details", None)
@@ -211,6 +254,28 @@ class ResponsesAPIProvider(Provider):
         except Exception as e:  # noqa: BLE001
             return False, f"unexpected error: {e}"
         return True, None
+
+
+def _droppable_unsupported_param(
+    error: ProviderError, kwargs: dict[str, Any]
+) -> str | None:
+    """Name of the sampling param this error blames, if we can safely drop it.
+
+    Returns None — meaning "let the error propagate" — unless all of:
+    the failure was a 400, the message names a parameter, that parameter is
+    one we consider advisory (`DROPPABLE_PARAMS`), and we actually sent it.
+    The last check matters: retrying without a param we never sent would just
+    replay the identical request and burn a second round-trip.
+    """
+    if error.error_type != "bad_request":
+        return None
+    match = _UNSUPPORTED_PARAM_RE.search(error.message)
+    if not match:
+        return None
+    name = match.group(1)
+    if name not in DROPPABLE_PARAMS or name not in kwargs:
+        return None
+    return name
 
 
 def _extract_usage(response: Any) -> TokenUsage | None:
