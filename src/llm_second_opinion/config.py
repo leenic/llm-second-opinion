@@ -36,12 +36,26 @@ DEFAULT_REQUEST_BUDGET_SECONDS = 200.0
 CLIENT_HARD_CAP_SECONDS = 240.0
 BUDGET_WARN_THRESHOLD_SECONDS = 235.0
 
-# Applied when the caller omits `max_tokens`. Long calls correlate with large
-# reasoning+output token counts, so an unbounded reply is the main driver of
-# tail latency. 8000 is roughly 4x the largest reply observed in testing
-# (grok-4.5 at 2021 output tokens), so it caps runaway generation without
-# truncating realistic answers. Set to null to leave replies unbounded.
-DEFAULT_MAX_TOKENS = 8000
+# Applied when the caller omits `max_tokens`. Set to null to leave replies
+# unbounded.
+#
+# Truncation is not a soft failure here: a reply that hits the cap comes back
+# `incomplete` and surfaces as an error, so the user gets nothing at all. That
+# makes a tight cap actively worse than a loose one, and an earlier value of
+# 8000 was cutting real reviews short.
+#
+# The real ceiling is the request budget, not the API. Measured against the
+# live providers: gemini-3.6-flash caps output at 65536 and sustains ~178
+# tok/s (~35k inside a 200s budget); OpenAI and xAI publish no hard cap at all
+# (both accepted max_output_tokens=10_000_000) but generate at ~62 and ~49
+# tok/s, so the budget binds first at roughly 12k and 10k. At 60000 both of
+# them ran out the full 200s and returned nothing.
+#
+# 32000 sits above every real answer observed (largest: 14129 billed tokens),
+# under Gemini's hard limit, and left the slowest provider at 53% of budget on
+# a full review. Beyond it the extra headroom is inert for OpenAI and xAI —
+# they hit the deadline before the cap.
+DEFAULT_MAX_TOKENS = 32000
 
 REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
 

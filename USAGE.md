@@ -57,7 +57,7 @@ When you ask Claude to call the tool, you can shape the call by mentioning these
 - **`focus`** — narrow the reviewer's attention. *"…focus on whether the rollback plan is realistic."*
 - **`system_prompt`** — replace the default reviewer persona. The default tells the external model to be direct, critical, and skip the praise. Override it only when you want a different kind of feedback (e.g., *"…use system_prompt: 'you are a hostile pentest reviewer'"*).
 - **`temperature`** — pass a number if you want it more deterministic (0–0.3) or more creative (0.8+). Most flagships ignore this for reasoning tracks anyway, and `gpt-5.6-sol` rejects it outright — but you can pass it to any model regardless: if the model refuses it, the server drops it and retries automatically, so you get an answer rather than an error. The trade-off is that the reply then uses the model's own default sampling, and the call takes one extra round-trip.
-- **`max_tokens`** — cap the length of the reply. Useful when you only want a quick verdict. If you don't pass one, `default_max_tokens` from the config applies (8000 by default) — enough for a full review, but it bounds a runaway reply.
+- **`max_tokens`** — cap the length of the reply. Useful when you only want a quick verdict, but note that hitting the cap fails the call rather than returning a shorter answer, so don't set it tight to "save tokens". If you don't pass one, `default_max_tokens` from the config applies (32000 by default), which is well clear of a full-length review.
 
 You don't need to remember the arg names — say what you want and Claude will map it.
 
