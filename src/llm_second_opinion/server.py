@@ -25,6 +25,7 @@ from .jobs import (
     BACKING_PROVIDER_BACKGROUND,
     STATUS_CANCELLED,
     STATUS_FAILED,
+    STATUS_SUBMITTING,
     STATUS_SUCCEEDED,
     JobRecord,
     JobRegistry,
@@ -38,7 +39,7 @@ from .providers import (
     SecondOpinionRequest,
     build_provider,
 )
-from .providers.base import SecondOpinionResponse
+from .providers.base import BackgroundPoll, SecondOpinionResponse
 from .providers.gemini import GeminiProvider
 from .providers.grok import GrokProvider
 from .providers.openai_provider import OpenAIProvider
@@ -307,8 +308,36 @@ def build_server(
                 "`summary` must be a non-empty string.", elapsed_ms=elapsed_ms(),
             )
 
+        submit_budget = jobs_mod.SUBMIT_BUDGET_SECONDS
+
         if request_key:
             existing = jobs.find_by_key(request_key)
+            if existing is not None and existing.status == STATUS_SUBMITTING:
+                # A concurrent submit with this key is awaiting upstream
+                # acknowledgement. Wait for it rather than start a second,
+                # separately billed job.
+                log.info(
+                    "rid=%s tool=submit_second_opinion jid=%s outcome=waiting_for_ack",
+                    request_id, existing.job_id,
+                )
+                try:
+                    await _run_bounded(existing.acknowledged.wait(), submit_budget, log)
+                except (asyncio.TimeoutError, TimeoutError):
+                    log.warning(
+                        "rid=%s tool=submit_second_opinion jid=%s outcome=timeout "
+                        "reason=original_submission_unacknowledged elapsed_ms=%d",
+                        request_id, existing.job_id, elapsed_ms(),
+                    )
+                    return _error_response(
+                        request_id, target_model, "timeout",
+                        f"An earlier submission with request_key {request_key!r} is "
+                        f"still awaiting upstream acknowledgement after "
+                        f"{submit_budget:g}s. Retry with the same request_key.",
+                        retriable=True, elapsed_ms=elapsed_ms(),
+                    )
+                # Registered as running, or released after a failed submission
+                # (in which case this call proceeds as a fresh submission).
+                existing = jobs.find_by_key(request_key)
             if existing is not None:
                 log.info(
                     "rid=%s tool=submit_second_opinion outcome=deduplicated jid=%s "
@@ -362,6 +391,15 @@ def build_server(
             if getattr(provider, "supports_background", False)
             else BACKING_LOCAL_TASK
         )
+        if backing == BACKING_LOCAL_TASK:
+            # The adapter's own HTTP timeout must span the *job*, not one
+            # synchronous call: built with request_budget_seconds it would cut
+            # a long grok review off at 200s no matter what the job budget is.
+            try:
+                provider = build_provider(target_model, config, timeout=config.job_budget_seconds)
+            except ProviderError as e:
+                return _error_response(request_id, target_model, e.error_type, e.message,
+                                       retriable=e.retriable, elapsed_ms=elapsed_ms())
         record = JobRecord(
             job_id=new_job_id(),
             provider=provider.name,
@@ -375,7 +413,6 @@ def build_server(
             request_key=request_key or None,
             adapter=provider,
         )
-        submit_budget = jobs_mod.SUBMIT_BUDGET_SECONDS
         log.info(
             "rid=%s tool=submit_second_opinion jid=%s provider=%s model=%s focus=%s "
             "temp=%s max_tokens=%s effort=%s web_search=%s backing=%s "
@@ -390,60 +427,70 @@ def build_server(
                       request_id, record.job_id, summary, focus)
 
         if backing == BACKING_PROVIDER_BACKGROUND:
+            # Hold the slot and the key while the upstream call is in flight,
+            # so concurrent submits cannot exceed the cap or duplicate the key.
+            # Released on every failure path below; `register` resolves it.
+            jobs.reserve(record)
+            acknowledged = False
             try:
-                upstream_id = await _run_bounded(
-                    provider.submit_background(req, timeout=submit_budget),
-                    submit_budget, log,
-                )
-            except (asyncio.TimeoutError, TimeoutError):
-                took = elapsed_ms()
-                log.warning(
-                    "rid=%s tool=submit_second_opinion jid=%s provider=%s outcome=timeout "
-                    "elapsed_ms=%d submit_budget_s=%.1f",
-                    request_id, record.job_id, provider.name, took, submit_budget,
-                )
-                return _error_response(
-                    request_id, target_model, "timeout",
-                    f"{provider.name} did not acknowledge the background submission "
-                    f"within the {submit_budget:g}s submit budget. If the upstream "
-                    f"accepted it anyway, that work is orphaned (billed, but with no "
-                    f"handle to retrieve it). Retry — with a request_key so a retry "
-                    f"that does get through is not duplicated.",
-                    retriable=True, model=record.model, elapsed_ms=took,
-                )
-            except ProviderError as e:
-                log.warning(
-                    "rid=%s tool=submit_second_opinion jid=%s provider=%s outcome=error "
-                    "type=%s status=%s elapsed_ms=%d",
-                    request_id, record.job_id, provider.name, e.error_type, e.status,
-                    elapsed_ms(),
-                )
-                return _error_response(request_id, target_model, e.error_type, e.message,
-                                       retriable=e.retriable, model=record.model,
-                                       elapsed_ms=elapsed_ms())
-            except Exception as e:  # noqa: BLE001 - last-resort safety net
-                log.exception(
-                    "rid=%s tool=submit_second_opinion jid=%s provider=%s "
-                    "outcome=internal_error elapsed_ms=%d",
-                    request_id, record.job_id, provider.name, elapsed_ms(),
-                )
-                return _error_response(request_id, target_model, "internal_error", str(e),
-                                       retriable=False, model=record.model,
-                                       elapsed_ms=elapsed_ms())
-            if not upstream_id:
-                log.error(
-                    "rid=%s tool=submit_second_opinion jid=%s provider=%s "
-                    "outcome=internal_error reason=no_upstream_id elapsed_ms=%d",
-                    request_id, record.job_id, provider.name, elapsed_ms(),
-                )
-                return _error_response(
-                    request_id, target_model, "internal_error",
-                    f"{provider.name} acknowledged the submission without an id to "
-                    f"poll by; nothing was registered.",
-                    retriable=True, model=record.model, elapsed_ms=elapsed_ms(),
-                )
-            record.upstream_id = str(upstream_id)
-            jobs.register(record)
+                try:
+                    upstream_id = await _run_bounded(
+                        provider.submit_background(req, timeout=submit_budget),
+                        submit_budget, log,
+                    )
+                except (asyncio.TimeoutError, TimeoutError):
+                    took = elapsed_ms()
+                    log.warning(
+                        "rid=%s tool=submit_second_opinion jid=%s provider=%s outcome=timeout "
+                        "elapsed_ms=%d submit_budget_s=%.1f",
+                        request_id, record.job_id, provider.name, took, submit_budget,
+                    )
+                    return _error_response(
+                        request_id, target_model, "timeout",
+                        f"{provider.name} did not acknowledge the background submission "
+                        f"within the {submit_budget:g}s submit budget. If the upstream "
+                        f"accepted it anyway, that work is orphaned (billed, but with no "
+                        f"handle to retrieve it). Retry — with a request_key so a retry "
+                        f"that does get through is not duplicated.",
+                        retriable=True, model=record.model, elapsed_ms=took,
+                    )
+                except ProviderError as e:
+                    log.warning(
+                        "rid=%s tool=submit_second_opinion jid=%s provider=%s outcome=error "
+                        "type=%s status=%s elapsed_ms=%d",
+                        request_id, record.job_id, provider.name, e.error_type, e.status,
+                        elapsed_ms(),
+                    )
+                    return _error_response(request_id, target_model, e.error_type, e.message,
+                                           retriable=e.retriable, model=record.model,
+                                           elapsed_ms=elapsed_ms())
+                except Exception as e:  # noqa: BLE001 - last-resort safety net
+                    log.exception(
+                        "rid=%s tool=submit_second_opinion jid=%s provider=%s "
+                        "outcome=internal_error elapsed_ms=%d",
+                        request_id, record.job_id, provider.name, elapsed_ms(),
+                    )
+                    return _error_response(request_id, target_model, "internal_error", str(e),
+                                           retriable=False, model=record.model,
+                                           elapsed_ms=elapsed_ms())
+                if not upstream_id:
+                    log.error(
+                        "rid=%s tool=submit_second_opinion jid=%s provider=%s "
+                        "outcome=internal_error reason=no_upstream_id elapsed_ms=%d",
+                        request_id, record.job_id, provider.name, elapsed_ms(),
+                    )
+                    return _error_response(
+                        request_id, target_model, "internal_error",
+                        f"{provider.name} acknowledged the submission without an id to "
+                        f"poll by; nothing was registered.",
+                        retriable=True, model=record.model, elapsed_ms=elapsed_ms(),
+                    )
+                record.upstream_id = str(upstream_id)
+                jobs.register(record)
+                acknowledged = True
+            finally:
+                if not acknowledged:
+                    jobs.release(record)
             record.driver = asyncio.ensure_future(
                 _drive_background_job(record, jobs, config, log)
             )
@@ -556,7 +603,7 @@ def build_server(
         if record.backing == BACKING_PROVIDER_BACKGROUND:
             control = jobs_mod.SUBMIT_BUDGET_SECONDS
             try:
-                await _run_bounded(
+                upstream_state = await _run_bounded(
                     record.adapter.cancel_background(record.upstream_id, timeout=control),
                     control, log,
                 )
@@ -593,9 +640,39 @@ def build_server(
                     request_id, record.job_id, "internal_error", str(e),
                     elapsed_ms=elapsed_ms(),
                 )
-            finished = jobs.finish(record, STATUS_CANCELLED, _cancelled_envelope(record))
+            # The upstream may have finished between two polls; its cancel
+            # endpoint then hands back the finished response. A billed,
+            # completed review is never discarded over a lost race: the job
+            # records its real terminal state, and the tool returns it.
+            race = ""
+            if (
+                isinstance(upstream_state, BackgroundPoll)
+                and upstream_state.done
+                and upstream_state.response is not None
+            ):
+                finished = jobs.finish(
+                    record, STATUS_SUCCEEDED,
+                    _succeeded_envelope(record, upstream_state.response),
+                )
+                race = " cancel=lost_race_upstream_completed"
+            elif (
+                isinstance(upstream_state, BackgroundPoll)
+                and upstream_state.done
+                and upstream_state.error is not None
+            ):
+                err = upstream_state.error
+                finished = jobs.finish(record, STATUS_FAILED, _failed_envelope(
+                    record, err.error_type, err.message, retriable=err.retriable,
+                ))
+                race = " cancel=lost_race_upstream_failed"
+            else:
+                finished = jobs.finish(record, STATUS_CANCELLED, _cancelled_envelope(record))
             if finished and record.driver is not None and not record.driver.done():
                 record.driver.cancel()
+            return _job_status_result(
+                request_id, record, "cancel_second_opinion", elapsed_ms(), log,
+                extra_log=(race or " cancel=issued") if finished else " cancel=lost_race",
+            )
         else:
             finished = jobs.finish(record, STATUS_CANCELLED, _cancelled_envelope(record))
             if finished and record.task is not None and not record.task.done():
@@ -736,7 +813,9 @@ async def _drive_background_job(
                 ))
                 return
 
-            control = jobs_mod.SUBMIT_BUDGET_SECONDS
+            # One poll never outlives the job budget: a hanging poll must not
+            # delay the upstream cancel past the deadline.
+            control = min(jobs_mod.SUBMIT_BUDGET_SECONDS, remaining)
             poll = None
             try:
                 poll = await _run_bounded(
@@ -744,7 +823,7 @@ async def _drive_background_job(
                 )
             except (asyncio.TimeoutError, TimeoutError):
                 log.warning(
-                    "jid=%s upstream_id=%s poll=timeout after %.0fs; retrying",
+                    "jid=%s upstream_id=%s poll=timeout after %.1fs; retrying",
                     record.job_id, upstream_id, control,
                 )
             except ProviderError as e:
@@ -765,6 +844,16 @@ async def _drive_background_job(
 
             if record.is_terminal:
                 return  # cancelled while we were polling
+            if poll is not None and poll.done and record.age_seconds() > budget:
+                # Observed only after the deadline: dead at the job level
+                # (invariant 4). The loop top cancels upstream and fails the
+                # job with `timeout`; a late completion is not resurrected.
+                log.info(
+                    "jid=%s upstream_id=%s poll=terminal_after_deadline "
+                    "upstream_status=%s; discarding",
+                    record.job_id, upstream_id, poll.upstream_status,
+                )
+                continue
             if poll is not None and poll.done:
                 if poll.error is not None:
                     jobs.finish(record, STATUS_FAILED, _failed_envelope(

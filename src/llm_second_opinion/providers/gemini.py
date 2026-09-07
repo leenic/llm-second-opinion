@@ -158,6 +158,25 @@ class GeminiProvider(Provider):
     async def poll_background(self, upstream_id: str, timeout: float) -> BackgroundPoll:
         client = self._client()
         response = await self._call(lambda: client.aio.interactions.get(id=upstream_id), timeout)
+        return self._classify(response)
+
+    async def cancel_background(
+        self, upstream_id: str, timeout: float
+    ) -> BackgroundPoll | None:
+        client = self._client()
+        response = await self._call(lambda: client.aio.interactions.cancel(id=upstream_id), timeout)
+        status = getattr(response, "status", None)
+        if status in _NON_TERMINAL_STATUSES or status in (None, "cancelled"):
+            # Stopped, or the status has not caught up with the cancel yet
+            # ("clean-up actions on the server can cause a slight delay").
+            return BackgroundPoll(True, upstream_status=status)
+        # Already finished before the cancel landed: keep that result.
+        return self._classify(response)
+
+    def _classify(self, response: Any) -> BackgroundPoll:
+        """Map a retrieved Interaction to a BackgroundPoll: `queued` /
+        `in_progress` ⇒ running; `requires_action` ⇒ terminal failure; any
+        other status through `_build_response`, the synchronous path's code."""
         status = getattr(response, "status", None)
         if status in _NON_TERMINAL_STATUSES:
             return BackgroundPoll(False, upstream_status=status)
@@ -179,10 +198,6 @@ class GeminiProvider(Provider):
             )
         except ProviderError as e:
             return BackgroundPoll(True, error=e, upstream_status=status)
-
-    async def cancel_background(self, upstream_id: str, timeout: float) -> None:
-        client = self._client()
-        await self._call(lambda: client.aio.interactions.cancel(id=upstream_id), timeout)
 
     def _build_response(self, response: Any, latency_ms: int) -> SecondOpinionResponse:
         """Validate a terminal Interaction and extract the final answer.

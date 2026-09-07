@@ -302,14 +302,18 @@ this section records what was built.
   envelopes, same `default_max_tokens` rule). Then: a `request_key` that matches a known job (running *or*
   terminal, until eviction) returns that job's submit shape with `"reused_existing_job": true` and no upstream
   call; the active-job cap returns `job_limit`; otherwise a `JobRecord` is created and started per the
-  provider's backing. Provider-backed (`supports_background`): `provider.submit_background(req, timeout=30)`
-  under `_run_bounded(…, SUBMIT_BUDGET_SECONDS)`; a timeout returns a `timeout` envelope whose message says the
-  work may be orphaned and to retry with a `request_key`; the job is registered only once the upstream id is
-  in hand, so `submitting` is never observed. Local-task (grok): registered immediately and the driver starts
-  `generate(req)`. Success shape: `success, request_id, job_id, target_model, provider, model, backing,
-  status, job_budget_seconds, poll_after_ms`. Two identical submits that overlap in time (the first not yet
-  acknowledged) both create jobs — the key is indexed at registration; the race the key guards is the
-  *lost-reply retry*, which arrives after registration.
+  provider's backing. Provider-backed (`supports_background`): the record is **reserved** first
+  (`JobRegistry.reserve` holds a capacity slot and the `request_key` while still `submitting`; `get()` hides
+  it because its id has not been disclosed), then `provider.submit_background(req, timeout=30)` runs under
+  `_run_bounded(…, SUBMIT_BUDGET_SECONDS)`; every failure path releases the reservation, and a timeout returns
+  a `timeout` envelope whose message says the work may be orphaned and to retry with a `request_key`. A
+  concurrent submit with the same key finds the reservation and waits (bounded by its own submit budget) on
+  the record's `acknowledged` event, then returns the registered job — or proceeds as a fresh submission if
+  the original failed and was released. So `submitting` is never observed, overlapping same-key submits create
+  one upstream job, and parallel submits cannot exceed the cap. Local-task (grok): the adapter is **rebuilt
+  with `timeout=job_budget_seconds`** (its HTTP client timeout must span the job, not one sync call),
+  registered immediately, and the driver starts `generate(req)`. Success shape: `success, request_id, job_id,
+  target_model, provider, model, backing, status, job_budget_seconds, poll_after_ms`.
 - **`get_second_opinion(job_id, wait_seconds=0)`** — unknown id ⇒ `unknown_job` (message names the three
   causes and the restart consequence per backing). `wait_seconds` is clamped to `[0, 45]` with a warning above
   the cap. A positive wait on a running job awaits the record's `done` event under `_run_bounded`; the wait,
@@ -320,15 +324,22 @@ this section records what was built.
   `request_id` and `elapsed_ms`, identical on every re-read until eviction.
 - **`cancel_second_opinion(job_id)`** — unknown ⇒ `unknown_job`; terminal ⇒ the terminal state (not an error).
   Provider-backed: `provider.cancel_background(upstream_id, timeout=30)` under `_run_bounded`; a failure of
-  that call is returned as its error and the job stays running. Then the record moves to `cancelled` and the
-  driver task is cancelled. Local-task: the record moves to `cancelled` and the generate task is torn down with
-  `_abandon` (cancel, wait at most `CANCEL_GRACE_SECONDS`, log and leave a task that ignores cancellation).
+  that call is returned as its error and the job stays running. The cancel call reports the upstream state
+  it saw (`BackgroundPoll | None`): if the upstream had already **finished between polls** — both vendors'
+  cancel endpoints are idempotent and hand the finished object back — the job records that real terminal
+  state (`succeeded` with the response, or `failed` with the mapped error) and the tool returns it, so a
+  billed result is never discarded over a lost race; otherwise the record moves to `cancelled`. Either way
+  the driver task is cancelled. Local-task: the record moves to `cancelled` and the generate task is torn
+  down with `_abandon` (cancel, wait at most `CANCEL_GRACE_SECONDS`, log and leave a task that ignores
+  cancellation).
 
 **Drivers.** Every job has one driver task, started at registration, and it is the *only* thing that talks to
 the upstream job after submission. Provider-backed: loop — if `age > job_budget_seconds`, best-effort upstream
-cancel and `failed(timeout)`; else `poll_background` bounded at `SUBMIT_BUDGET_SECONDS` (a poll-call timeout
-or a *retriable* `ProviderError` is logged and retried next interval; a non-retriable one fails the job);
-a `done` poll finishes the job with the response or the mapped error; otherwise sleep
+cancel and `failed(timeout)`; else `poll_background` bounded at `min(SUBMIT_BUDGET_SECONDS, remaining budget)`
+so a hanging poll can never delay the upstream cancel past the deadline (a poll-call timeout or a *retriable*
+`ProviderError` is logged and retried next interval; a non-retriable one fails the job); a `done` poll
+observed **after** the deadline is discarded and the loop top fails the job with `timeout` (invariant 4);
+a `done` poll within budget finishes the job with the response or the mapped error; otherwise sleep
 `min(POLL_INTERVAL_SECONDS, remaining budget)`. Local-task: `_run_bounded(generate(req), job_budget_seconds,
 on_start=record.attach_task)` — the same machinery as the sync path with the larger budget, so a task that
 ignores cancellation is abandoned with the existing log line. A driver never surfaces an exception: any

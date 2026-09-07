@@ -119,6 +119,10 @@ class JobRecord:
     envelope: dict[str, Any] | None = None
     # Set on terminal transition; long-polls wait on it.
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    # Set when the reservation resolves either way (registered as running, or
+    # released after a failed submission); a concurrent same-key submit waits
+    # on it instead of starting a second upstream job.
+    acknowledged: asyncio.Event = field(default_factory=asyncio.Event)
 
     @property
     def is_terminal(self) -> bool:
@@ -188,8 +192,13 @@ class JobRegistry:
         return evicted
 
     def get(self, job_id: str) -> JobRecord | None:
+        """Look a job up by id. A reservation that is still `submitting` is
+        not addressable — its id has not been disclosed to any client."""
         self.sweep()
-        return self._jobs.get(job_id)
+        rec = self._jobs.get(job_id)
+        if rec is not None and rec.status == STATUS_SUBMITTING:
+            return None
+        return rec
 
     def find_by_key(self, request_key: str) -> JobRecord | None:
         self.sweep()
@@ -215,16 +224,44 @@ class JobRegistry:
 
     # -- mutation -------------------------------------------------------
 
+    def reserve(self, record: JobRecord) -> JobRecord:
+        """Hold a slot and the request_key for a submission that is awaiting
+        upstream acknowledgement.
+
+        Reserving *before* the upstream call is what makes the capacity cap and
+        the idempotency key hold under concurrency: a second submit with the
+        same key finds the reservation and waits on `acknowledged` instead of
+        starting a second, separately billed job, and N parallel submits cannot
+        all pass the cap check. The record stays `submitting`, which `get()`
+        hides — its id is not disclosed until `register`.
+        """
+        if record.status != STATUS_SUBMITTING:
+            raise JobStateError(f"job {record.job_id}: can only reserve a submitting job")
+        self._jobs[record.job_id] = record
+        if record.request_key is not None:
+            self._by_key[record.request_key] = record.job_id
+        return record
+
+    def release(self, record: JobRecord) -> None:
+        """Drop a reservation whose submission failed; wakes any waiter."""
+        if record.status == STATUS_SUBMITTING and self._jobs.get(record.job_id) is record:
+            del self._jobs[record.job_id]
+            if record.request_key is not None and self._by_key.get(record.request_key) == record.job_id:
+                del self._by_key[record.request_key]
+        record.acknowledged.set()
+
     def register(self, record: JobRecord) -> JobRecord:
         """Admit an acknowledged job: `submitting -> running`, index its key.
 
-        Called only once the upstream has acknowledged (or, for local tasks,
-        once the task is started), so a client never observes `submitting`.
+        Called once the upstream has acknowledged (or, for local tasks, once
+        the task is started), so a client never observes `submitting`. Works
+        with or without a prior `reserve`.
         """
         record.transition(STATUS_RUNNING)
         self._jobs[record.job_id] = record
         if record.request_key is not None:
             self._by_key[record.request_key] = record.job_id
+        record.acknowledged.set()
         return record
 
     def finish(self, record: JobRecord, status: str, envelope: dict[str, Any]) -> bool:

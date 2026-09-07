@@ -18,8 +18,15 @@ TARGET_TO_PROVIDER: dict[str, str] = {
 PROVIDER_TO_TARGET: dict[str, str] = {v: k for k, v in TARGET_TO_PROVIDER.items()}
 
 
-def build_provider(target_model: str, config: AppConfig) -> Provider:
-    """Build a provider for a `target_model` value from the tool input."""
+def build_provider(
+    target_model: str, config: AppConfig, timeout: float | None = None
+) -> Provider:
+    """Build a provider for a `target_model` value from the tool input.
+
+    `timeout` defaults to `request_budget_seconds` (the synchronous tool's
+    bound). A local-task background job passes `job_budget_seconds` instead:
+    the adapter's HTTP client timeout must span the job, not one sync call.
+    """
     if target_model not in TARGET_TO_PROVIDER:
         raise ProviderError(
             "invalid_input",
@@ -43,7 +50,7 @@ def build_provider(target_model: str, config: AppConfig) -> Provider:
     kwargs = {
         "api_key": pcfg.api_key,
         "model": pcfg.model,
-        "timeout": config.request_budget_seconds,
+        "timeout": config.request_budget_seconds if timeout is None else timeout,
         "reasoning_effort": pcfg.reasoning_effort,
         "web_search": pcfg.web_search,
     }

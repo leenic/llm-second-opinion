@@ -191,31 +191,49 @@ class ResponsesAPIProvider(Provider):
     async def poll_background(self, upstream_id: str, timeout: float) -> BackgroundPoll:
         client = self._client().with_options(timeout=timeout)
         response = await self._mapped(client.responses.retrieve(upstream_id), timeout)
+        poll = self._classify(response)
+        if poll.done and poll.response is None and poll.error is None:
+            # Cancelled from outside this server: nobody here asked for it.
+            poll.error = ProviderError(
+                "upstream_error",
+                f"{self.name} response was cancelled upstream",
+                retriable=False,
+            )
+        return poll
+
+    async def cancel_background(
+        self, upstream_id: str, timeout: float
+    ) -> BackgroundPoll | None:
+        client = self._client().with_options(timeout=timeout)
+        # Idempotent upstream: a response that already finished is returned
+        # as-is, so the caller can keep that result instead of losing it.
+        response = await self._mapped(client.responses.cancel(upstream_id), timeout)
+        poll = self._classify(response)
+        if not poll.done:
+            # The cancel was accepted but the status has not caught up yet;
+            # from this server's point of view the job is cancelled.
+            return BackgroundPoll(True, upstream_status=poll.upstream_status)
+        return poll
+
+    def _classify(self, response: Any) -> BackgroundPoll:
+        """Map a retrieved/cancelled Responses payload to a BackgroundPoll.
+
+        `queued`/`in_progress` ⇒ running; `cancelled` ⇒ done with neither
+        response nor error; any other terminal status goes through
+        `_build_response`, the exact code the synchronous path uses, so the
+        failed/incomplete/refusal/empty mappings are shared.
+        """
         status = getattr(response, "status", None)
         if status in _NON_TERMINAL_STATUSES:
             return BackgroundPoll(False, upstream_status=status)
         if status == "cancelled":
-            return BackgroundPoll(
-                True,
-                error=ProviderError(
-                    "upstream_error",
-                    f"{self.name} response was cancelled upstream",
-                    retriable=False,
-                ),
-                upstream_status=status,
-            )
-        # Terminal: the exact payload the synchronous path validates, through
-        # the same code — failed/incomplete/refusal/empty mappings are shared.
+            return BackgroundPoll(True, upstream_status=status)
         try:
             return BackgroundPoll(
                 True, response=self._build_response(response, 0), upstream_status=status
             )
         except ProviderError as e:
             return BackgroundPoll(True, error=e, upstream_status=status)
-
-    async def cancel_background(self, upstream_id: str, timeout: float) -> None:
-        client = self._client().with_options(timeout=timeout)
-        await self._mapped(client.responses.cancel(upstream_id), timeout)
 
     async def _mapped(self, awaitable: Any, timeout: float) -> Any:
         """Await one SDK call with its exceptions mapped to ProviderError."""

@@ -129,9 +129,19 @@ class Provider(ABC):
         """Observe the upstream job once. See `BackgroundPoll`."""
         raise NotImplementedError(f"{self.name} has no background mode")
 
-    async def cancel_background(self, upstream_id: str, timeout: float) -> None:
+    async def cancel_background(
+        self, upstream_id: str, timeout: float
+    ) -> BackgroundPoll | None:
         """Cancel the upstream job. Idempotent: cancelling a finished job is
-        not an error."""
+        not an error.
+
+        Returns the upstream state the cancel call reported, when the vendor
+        reports one: a job that had already finished comes back as a `done`
+        poll carrying its response (or its mapped error) so the caller can
+        preserve a completed, billed result instead of discarding it; a job
+        that was actually stopped comes back `done` with neither. `None`
+        means "cancelled, nothing more known".
+        """
         raise NotImplementedError(f"{self.name} has no background mode")
 
     @abstractmethod

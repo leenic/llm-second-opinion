@@ -246,9 +246,10 @@ class BackgroundStub(Provider):
     async def submit_background(self, req, timeout):
         self.requests.append(req)
         self.creates += 1
+        error = self.submit_error  # captured at call time: the in-flight attempt's fate
         await asyncio.sleep(self.submit_delay)
-        if self.submit_error is not None:
-            raise self.submit_error
+        if error is not None:
+            raise error
         return UPSTREAM_ID
 
     async def poll_background(self, upstream_id, timeout):
@@ -442,6 +443,149 @@ class TestSubmit:
         assert "request_key" in result["error"]["message"]
         assert result["elapsed_ms"] < 2000
         assert len(t.registry) == 0
+
+
+class TestSubmitReservation:
+    """The slot and the request_key are held while the upstream call is in
+    flight, so concurrency cannot duplicate a job or overrun the cap."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_key_submits_create_one_job(self, tools):
+        t = tools(BackgroundStub(submit_delay=0.05))
+        first, second = await asyncio.gather(
+            t.submit(request_key="k-1"), t.submit(request_key="k-1"),
+        )
+        assert first["success"] and second["success"]
+        assert first["job_id"] == second["job_id"]
+        assert first["status"] == second["status"] == STATUS_RUNNING
+        assert t.provider.creates == 1, "one upstream submission"
+        assert {first.get("reused_existing_job"), second.get("reused_existing_job")} == {None, True}
+
+    @pytest.mark.asyncio
+    async def test_in_flight_submit_counts_toward_the_cap(self, tools):
+        t = tools(BackgroundStub(submit_delay=0.05), registry=JobRegistry(max_active=1))
+        first = asyncio.ensure_future(t.submit())
+        await asyncio.sleep(0.01)
+        second = await t.submit()
+        assert second["success"] is False
+        assert second["error"]["type"] == "job_limit"
+        assert (await first)["success"] is True
+        assert t.provider.creates == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_submit_releases_slot_and_key(self, tools):
+        t = tools(BackgroundStub(submit_error=ProviderError("rate_limit", "slow", retriable=True)),
+                  registry=JobRegistry(max_active=1))
+        first = await t.submit(request_key="k-1")
+        assert first["error"]["type"] == "rate_limit"
+        assert len(t.registry) == 0
+        t.provider.submit_error = None
+        second = await t.submit(request_key="k-1")
+        assert second["success"] is True
+        assert "reused_existing_job" not in second
+        assert t.provider.creates == 2
+
+    @pytest.mark.asyncio
+    async def test_waiter_proceeds_fresh_when_the_original_fails(self, tools):
+        t = tools(BackgroundStub(submit_delay=0.05,
+                                 submit_error=ProviderError("rate_limit", "slow", retriable=True)))
+        first = asyncio.ensure_future(t.submit(request_key="k-1"))
+        await asyncio.sleep(0.01)
+        t.provider.submit_error = None  # only the in-flight attempt fails
+        second = await t.submit(request_key="k-1")
+        assert (await first)["error"]["type"] == "rate_limit"
+        assert second["success"] is True
+        assert second["status"] == STATUS_RUNNING
+        assert t.provider.creates == 2
+
+    @pytest.mark.asyncio
+    async def test_waiter_times_out_if_the_original_is_still_unacknowledged(self, tools, monkeypatch):
+        """The waiter's bound is its own submit budget; it does not inherit
+        the original's. Here the original still has time left when the
+        waiter gives up, so the waiter reports what it is waiting on."""
+        monkeypatch.setattr(jobs_mod, "SUBMIT_BUDGET_SECONDS", 10.0)
+        t = tools(BackgroundStub(submit_delay=10))
+        first = asyncio.ensure_future(t.submit(request_key="k-1"))
+        await asyncio.sleep(0.01)
+        monkeypatch.setattr(jobs_mod, "SUBMIT_BUDGET_SECONDS", 0.05)
+        second = await t.submit(request_key="k-1")
+        assert second["error"]["type"] == "timeout"
+        assert second["error"]["retriable"] is True
+        assert "k-1" in second["error"]["message"]
+        assert t.provider.creates == 1, "the waiter must not start a second upstream job"
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+    @pytest.mark.asyncio
+    async def test_waiter_proceeds_fresh_when_the_original_times_out(self, tools, monkeypatch):
+        """A released reservation wakes the waiter, which then submits itself."""
+        monkeypatch.setattr(jobs_mod, "SUBMIT_BUDGET_SECONDS", 0.05)
+        t = tools(BackgroundStub(submit_delay=10))
+        first = asyncio.ensure_future(t.submit(request_key="k-1"))
+        await asyncio.sleep(0.01)
+        t.provider.submit_delay = 0  # the retry is acknowledged at once
+        second = await t.submit(request_key="k-1")
+        assert (await first)["error"]["type"] == "timeout"
+        assert second["success"] is True
+        assert second["status"] == STATUS_RUNNING
+        assert t.provider.creates == 2
+
+    @pytest.mark.asyncio
+    async def test_submitting_reservation_is_not_addressable(self, tools):
+        t = tools(BackgroundStub(submit_delay=0.05))
+        pending = asyncio.ensure_future(t.submit(request_key="k-1"))
+        await asyncio.sleep(0.01)
+        reserved = t.registry.find_by_key("k-1")
+        assert reserved is not None and reserved.status == STATUS_SUBMITTING
+        assert t.registry.get(reserved.job_id) is None
+        assert (await t.get(reserved.job_id))["error"]["type"] == "unknown_job"
+        assert (await pending)["job_id"] == reserved.job_id
+        assert t.registry.get(reserved.job_id) is reserved
+
+
+class TestLocalTaskTimeout:
+    @pytest.mark.asyncio
+    async def test_local_task_adapter_is_built_with_the_job_budget(self, tools, monkeypatch):
+        """The adapter's HTTP timeout must span the job, not one sync call."""
+        import llm_second_opinion.server as server_mod
+
+        provider = StubProvider(delay=0)
+        built: list[dict] = []
+
+        def fake_build(target_model, config, **kwargs):
+            built.append(dict(kwargs))
+            return provider
+
+        t = tools(provider, make_config(budget=0.05, job_budget=123.0))
+        monkeypatch.setattr(server_mod, "build_provider", fake_build)
+        job_id = (await t.submit(target_model="grok"))["job_id"]
+        await t.wait_for(job_id, STATUS_SUCCEEDED)
+        assert built[-1] == {"timeout": 123.0}
+
+    @pytest.mark.asyncio
+    async def test_background_adapter_keeps_the_default_construction(self, tools, monkeypatch):
+        import llm_second_opinion.server as server_mod
+
+        provider = BackgroundStub()
+        built: list[dict] = []
+
+        def fake_build(target_model, config, **kwargs):
+            built.append(dict(kwargs))
+            return provider
+
+        t = tools(provider, make_config(job_budget=123.0))
+        monkeypatch.setattr(server_mod, "build_provider", fake_build)
+        await t.submit()
+        assert built == [{}]
+
+    def test_factory_timeout_override(self):
+        from llm_second_opinion.providers import build_provider
+
+        cfg = make_config(budget=200.0, job_budget=900.0)
+        assert build_provider("grok", cfg).timeout == 200.0
+        assert build_provider("grok", cfg, timeout=900.0).timeout == 900.0
+        assert build_provider("chatgpt", cfg).timeout == 200.0
 
 
 class TestIdempotentSubmit:
@@ -665,6 +809,42 @@ class TestCancellationAsymmetry:
         assert t.provider.cancels == 0, "nothing to cancel upstream"
 
     @pytest.mark.asyncio
+    async def test_cancel_preserves_a_result_that_finished_upstream_between_polls(self, tools):
+        """The upstream finished after our last poll; its cancel endpoint
+        hands the finished response back. A billed result is never discarded."""
+        t = tools(BackgroundStub())
+        job_id = (await t.submit())["job_id"]
+
+        async def cancel_returns_finished(upstream_id, timeout):
+            t.provider.cancels += 1
+            return BackgroundPoll(True, response=stub_response("finished first"),
+                                  upstream_status="completed")
+
+        t.provider.cancel_background = cancel_returns_finished
+        result = await t.cancel(job_id)
+        assert result["success"] is True
+        assert result["status"] == STATUS_SUCCEEDED
+        assert result["response"] == "finished first"
+        assert t.provider.cancels == 1
+        assert (await t.get(job_id))["status"] == STATUS_SUCCEEDED
+        await asyncio.sleep(0.05)
+        assert t.registry.get(job_id).driver.done()
+
+    @pytest.mark.asyncio
+    async def test_cancel_reports_a_failure_that_landed_upstream_between_polls(self, tools):
+        t = tools(BackgroundStub())
+        job_id = (await t.submit())["job_id"]
+
+        async def cancel_returns_failed(upstream_id, timeout):
+            return BackgroundPoll(True, error=ProviderError("content_blocked", "refused"),
+                                  upstream_status="incomplete")
+
+        t.provider.cancel_background = cancel_returns_failed
+        result = await t.cancel(job_id)
+        assert result["status"] == STATUS_FAILED
+        assert result["error"]["type"] == "content_blocked"
+
+    @pytest.mark.asyncio
     async def test_cancel_unknown_job(self, tools):
         t = tools(BackgroundStub())
         result = await t.cancel("000000000000")
@@ -714,6 +894,32 @@ class TestJobBudget:
         result = await t.get(job_id)
         assert result["status"] == STATUS_FAILED
         assert "too late" not in json.dumps(result)
+
+    @pytest.mark.asyncio
+    async def test_completion_observed_after_the_deadline_is_dead(self, tools, monkeypatch):
+        """A poll in flight across the deadline: its bound is the remaining
+        budget, and a terminal payload seen past the deadline is discarded."""
+        import llm_second_opinion.server as server_mod
+
+        monkeypatch.setattr(server_mod, "CANCEL_GRACE_SECONDS", 0.01)
+        t = tools(BackgroundStub(), make_config(job_budget=0.1))
+        job_id = (await t.submit())["job_id"]
+        original = t.provider.poll_background
+        seen_timeouts: list[float] = []
+
+        async def slow_poll(upstream_id, timeout):
+            seen_timeouts.append(timeout)
+            await asyncio.sleep(0.15)  # completes only after the job deadline
+            t.provider.complete("arrived late")
+            return await original(upstream_id, timeout)
+
+        t.provider.poll_background = slow_poll
+        result = await t.wait_for(job_id, STATUS_FAILED)
+        assert result["error"]["type"] == "timeout"
+        assert "arrived late" not in json.dumps(result)
+        assert t.provider.cancels == 1
+        assert all(tm <= 0.1 for tm in seen_timeouts), seen_timeouts
+        assert result["job_elapsed_ms"] < 1000, "cancel not delayed by the hanging poll"
 
 
 class TestUpstreamOutcomes:
@@ -1207,9 +1413,24 @@ class TestOpenAIBackground:
     @pytest.mark.asyncio
     async def test_cancel_posts_to_the_cancel_endpoint(self):
         provider, client = responses_provider(cancel=SimpleNamespace(id="resp_1", status="cancelled"))
-        await provider.cancel_background("resp_1", timeout=30.0)
+        outcome = await provider.cancel_background("resp_1", timeout=30.0)
         assert client.calls["cancel"][0][0] == ("resp_1",)
         assert client.options == [{"timeout": 30.0}]
+        assert outcome.done and outcome.response is None and outcome.error is None
+        assert outcome.upstream_status == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_cancel_of_a_finished_response_returns_it(self):
+        """Idempotent upstream: the finished Response comes back and is kept."""
+        provider, _ = responses_provider(cancel=responses_result(text_message(ANSWER)))
+        outcome = await provider.cancel_background("resp_1", timeout=30.0)
+        assert outcome.done and outcome.response.text == ANSWER
+
+    @pytest.mark.asyncio
+    async def test_cancel_with_lagging_status_counts_as_cancelled(self):
+        provider, _ = responses_provider(cancel=SimpleNamespace(id="resp_1", status="in_progress"))
+        outcome = await provider.cancel_background("resp_1", timeout=30.0)
+        assert outcome.done and outcome.response is None and outcome.error is None
 
     @pytest.mark.asyncio
     async def test_sync_generate_is_unchanged_by_the_refactor(self, make_provider, request_factory):
@@ -1341,8 +1562,28 @@ class TestGeminiBackground:
     @pytest.mark.asyncio
     async def test_cancel_calls_the_cancel_surface(self):
         provider, client = gemini_provider(cancel=interaction("cancelled", None))
-        await provider.cancel_background("int_1", timeout=30.0)
+        outcome = await provider.cancel_background("int_1", timeout=30.0)
         assert client.calls["cancel"][0] == {"id": "int_1"}
+        assert outcome.done and outcome.response is None and outcome.error is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["in_progress", "queued"])
+    async def test_cancel_with_lagging_status_counts_as_cancelled(self, status):
+        provider, _ = gemini_provider(cancel=interaction(status, None))
+        outcome = await provider.cancel_background("int_1", timeout=30.0)
+        assert outcome.done and outcome.response is None and outcome.error is None
+
+    @pytest.mark.asyncio
+    async def test_cancel_of_a_finished_interaction_returns_it(self):
+        provider, _ = gemini_provider(cancel=interaction("completed"))
+        outcome = await provider.cancel_background("int_1", timeout=30.0)
+        assert outcome.done and outcome.response.text == ANSWER
+
+    @pytest.mark.asyncio
+    async def test_poll_cancelled_from_outside_is_the_sync_mapping(self):
+        provider, _ = gemini_provider(get=interaction("cancelled"))
+        poll = await provider.poll_background("int_1", timeout=30.0)
+        assert poll.done and poll.error.error_type == "content_blocked"
 
     @pytest.mark.asyncio
     async def test_sync_generate_is_unchanged_by_the_refactor(self, request_factory):
