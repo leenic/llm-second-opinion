@@ -144,6 +144,7 @@
   .toolchip .spin { width: 11px; height: 11px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
   .toolchip.done .spin { border: none; }
   .toolchip .tick { color: var(--accent-2); }
+  .toolchip .res { color: var(--text); }
   @keyframes spin { to { transform: rotate(360deg); } }
 
   .opinion-wrap { padding-left: 44px; }
@@ -258,9 +259,9 @@
       <a class="btn" href="#quickstart">Quickstart</a>
     </div>
     <div class="hero-meta">
-      <span><b>2</b> tools — <code style="font-family:var(--mono)">second_opinion</code>, <code style="font-family:var(--mono)">list_available_models</code></span>
+      <span><b>5</b> tools — <code style="font-family:var(--mono)">second_opinion</code>, <code style="font-family:var(--mono)">submit</code>/<code style="font-family:var(--mono)">get</code>/<code style="font-family:var(--mono)">cancel_second_opinion</code>, <code style="font-family:var(--mono)">list_available_models</code></span>
       <span><b>3</b> external models, each with optional web search</span>
-      <span><b>0</b> conversation data stored — single-turn, nothing persisted</span>
+      <span><b>0</b> conversation data stored by the server — single-turn, nothing persisted</span>
     </div>
   </div>
 </div>
@@ -314,6 +315,8 @@
       than any training cutoff. You stay in the driver's seat — after Claude's first take, you ask for one external
       opinion at a time (“get a second opinion from Gemini”, “have ChatGPT suggest what's missing”, “get Grok to
       cross-check”). Each request fires a single MCP call, and Claude folds the reply into a revised recommendation.
+      The last act shows the other mode: a review too heavy for one call is <b>submitted as a background job</b>,
+      polled, and collected minutes later.
     </p>
 
     <div class="demo-shell" id="demoShell">
@@ -340,7 +343,7 @@
   <div class="wrap">
     <span class="eyebrow">How it works</span>
     <h2>An MCP tool call, four steps deep</h2>
-    <p class="sub">The server speaks MCP over stdio. Claude calls a tool; the server forwards your summary to one external model in a single, stateless turn and returns the reply as structured JSON.</p>
+    <p class="sub">The server speaks MCP over stdio. Claude calls a tool; the server forwards your summary to one external model in a single, stateless turn and returns the reply as structured JSON. For reviews that need minutes rather than seconds, <code style="font-family:var(--mono);color:var(--accent-2)">submit_second_opinion</code> starts the same review as a background job and <code style="font-family:var(--mono);color:var(--accent-2)">get_second_opinion</code> collects it — every tool call stays short.</p>
     <div class="card" style="padding:8px;">
       <div class="flow">
         <div class="step"><div class="n">1</div><h4>You ask Claude</h4><p>“Get a second opinion from Gemini on this plan.” Claude writes a self-contained summary of the context.</p></div>
@@ -386,12 +389,17 @@
           <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>reasoning_effort</b><code style="font-family:var(--mono);color:var(--accent-2)">minimal · low · medium · high</code> — how hard the model thinks before answering.</span></div>
           <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>web_search</b>Attach the provider's built-in search tool — the key to fresh facts.</span></div>
           <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>model override</b>Point any target at a different model name, no code change.</span></div>
-          <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>timeout_seconds</b>Per-request wall-clock bound (retries off, so it's exact).</span></div>
+          <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>request_budget_seconds · job_budget_seconds</b>Wall-clock bounds: 200 s for a synchronous call (retries off, so it's exact), 15 min for a background job.</span></div>
         </div>
       </div>
     </div>
 
-    <div class="grid cols-3" style="margin-top:18px;">
+    <div class="grid cols-2" style="margin-top:18px;">
+      <div class="card">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/><path d="M3 3l2 2M21 3l-2 2"/></svg></div>
+        <h3>Background jobs for long reviews</h3>
+        <p>A whole document, web search on, high reasoning effort — <code style="font-family:var(--mono);color:var(--accent-2)">submit_second_opinion</code> returns a job id in seconds and the review runs upstream for up to 15 minutes (OpenAI and Google background execution; an in-process task for Grok). <code style="font-family:var(--mono);color:var(--accent-2)">get_second_opinion</code> polls it, results stay readable for 30 minutes, and only an explicit cancel stops it. Retries are safe: a <code style="font-family:var(--mono)">request_key</code> makes a repeated submit return the same job.</p>
+      </div>
       <div class="card">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></div>
         <h3>Reachability checks</h3>
@@ -400,12 +408,12 @@
       <div class="card">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></div>
         <h3>Graceful, typed errors</h3>
-        <p>Failures never crash the call — you get <code style="font-family:var(--mono);color:var(--accent-2)">success:false</code> with a type like <code style="font-family:var(--mono)">auth_failed</code>, <code style="font-family:var(--mono)">rate_limit</code>, <code style="font-family:var(--mono)">timeout</code>, or <code style="font-family:var(--mono)">content_blocked</code>.</p>
+        <p>Failures never crash the call — you get <code style="font-family:var(--mono);color:var(--accent-2)">success:false</code> with a type like <code style="font-family:var(--mono)">auth_failed</code>, <code style="font-family:var(--mono)">rate_limit</code>, <code style="font-family:var(--mono)">timeout</code>, <code style="font-family:var(--mono)">content_blocked</code>, or <code style="font-family:var(--mono)">unknown_job</code>.</p>
       </div>
       <div class="card">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
         <h3>Keys stay local</h3>
-        <p>API keys live only in a git-ignored <code style="font-family:var(--mono)">config.json</code> (or env vars). Nothing is logged by default; no conversation history is forwarded.</p>
+        <p>API keys live only in a git-ignored <code style="font-family:var(--mono)">config.json</code> (or env vars). Nothing is logged by default; no conversation history is forwarded. Background jobs are the one exception to “nothing stored”: the chosen vendor keeps the request and reply under its own retention policy — use the synchronous tool if that matters.</p>
       </div>
     </div>
 
@@ -476,7 +484,8 @@ notepad config.json   <span class="c"># add the keys you have</span></pre>
     <div class="limits">
       <div>Single-turn only — no conversation history is forwarded to the external model.</div>
       <div>No response streaming — the full reply arrives at once.</div>
-      <div>No caching, cost tracking, or budget enforcement — watch your provider dashboards.</div>
+      <div>Background jobs live in memory — a server restart orphans them (ChatGPT/Gemini jobs still finish and bill upstream).</div>
+      <div>No caching, cost tracking, or spend enforcement — only time budgets; watch your provider dashboards.</div>
       <div>No server-side rate limiting — it relies on the upstream provider's limits.</div>
       <div>Stdio transport only — no HTTP or remote-access mode in v1.</div>
       <div>Reachability is a key/outage probe — it doesn't validate the exact model name.</div>
@@ -527,7 +536,19 @@ notepad config.json   <span class="c"># add the keys you have</span></pre>
     { t: 'user', text: "Get Grok to cross-check the list." },
     { t: 'tool', model: 'grok' },
     { t: 'opinion', cls: 'grok', name: 'Grok · 4.5', tag: 'web_search', html: "No bad picks, but you're tuning the wrong layer: the <b>capture trigger beats the app</b>. Whatever you choose, bind a global hotkey / Siri / a single home-screen widget — that's where friction actually lives. One caution: a fast app you can't trust to sync is worse than a plain note that does, so weight <b>sync reliability</b> too." },
-    { t: 'claude', text: "Grok cross-checks clean — same picks, sharper framing. <b>Final take:</b> choose by ecosystem (<b>Apple Reminders</b> / <b>Drafts</b> on Apple; <b>Todoist</b> / <b>TickTick</b> / <b>Google Keep</b> cross-platform; <b>Microsoft To Do</b> on Windows), then invest in the <b>capture trigger</b> — hotkey, Siri, or one widget — and confirm sync is rock-solid. That ordering matters more than the specific app." }
+    { t: 'claude', text: "Grok cross-checks clean — same picks, sharper framing. <b>Final take:</b> choose by ecosystem (<b>Apple Reminders</b> / <b>Drafts</b> on Apple; <b>Todoist</b> / <b>TickTick</b> / <b>Google Keep</b> cross-platform; <b>Microsoft To Do</b> on Windows), then invest in the <b>capture trigger</b> — hotkey, Siri, or one widget — and confirm sync is rock-solid. That ordering matters more than the specific app." },
+
+    // Act 2: a review too heavy for one tool call runs as a background job —
+    // submit returns a job id in seconds, get polls it, the result arrives
+    // minutes later without any single call approaching the client's cap.
+    { t: 'user', text: "Good. Now the heavy one: send our whole <b>40-page requirements doc</b> to ChatGPT for a full review — research pass, red team, three role critiques, web search on. Run it in the background; that won't fit in one call." },
+    { t: 'tool', label: 'submit_second_opinion · target=chatgpt · request_key=req-7f3a', done: 'job_id=9f8e7d6c5b4a · 0.8 s' },
+    { t: 'claude', text: "Submitted — ChatGPT is reviewing it as background job <b>9f8e7d6c5b4a</b>. I'll check in 45 seconds; ask me any time if you want an update." },
+    { t: 'tool', label: 'get_second_opinion · wait_seconds=45', done: 'running · retry_after 15 s', wait: 1500 },
+    { t: 'claude', text: "Still running after 45 s — a full-document review with search takes a few minutes. I'll poll again shortly rather than tie up the session." },
+    { t: 'tool', label: 'get_second_opinion · wait_seconds=45', done: 'succeeded · job 6 m 28 s', wait: 1500 },
+    { t: 'opinion', cls: 'gpt', name: 'ChatGPT · gpt-5.6-sol', tag: 'background · 6m 28s', html: "<b>Research pass:</b> two cited standards were superseded this spring. <b>Red team:</b> the offline-sync section assumes clocks agree; it doesn't survive a device restored from backup. <b>Role critiques</b> (ops, security, support) attached in full — 14k tokens, well past what a single 200 s call could carry." },
+    { t: 'claude', text: "The full review is back — six and a half minutes of upstream work, delivered through two short polls. Headline: update the two superseded references, and the <b>offline-sync clock assumption</b> is a real design gap worth fixing before the next draft. Want me to walk through the three role critiques?" }
   ];
 
   var timers = [];
@@ -551,17 +572,21 @@ notepad config.json   <span class="c"># add the keys you have</span></pre>
       timers.push(setTimeout(done, 60));
     }
     else if (step.t === 'tool') {
-      // A single second_opinion MCP call to one provider.
+      // One MCP call: a synchronous second_opinion to one provider, or one
+      // of the short submit/get calls of a background job.
+      var label = step.label || ('second_opinion · target=' + step.model + ' · web_search');
+      var wait = step.wait || 950;
       var row = el('<div class="toolrow"></div>');
-      var chip = el('<span class="toolchip"><span class="spin"></span>second_opinion · target=' + step.model + ' · web_search</span>');
+      var chip = el('<span class="toolchip"><span class="spin"></span>' + label + '</span>');
       row.appendChild(chip);
       feed.appendChild(row);
       requestAnimationFrame(function(){ row.classList.add('show'); });
       timers.push(setTimeout(function(){
         chip.classList.add('done');
-        chip.querySelector('.spin').outerHTML = '<span class="tick">✓</span>';
-      }, 950));
-      timers.push(setTimeout(done, 1200));
+        chip.querySelector('.spin').outerHTML = '<span class="tick">✓</span>' +
+          (step.done ? '<span class="res">→ ' + step.done + '</span>' : '');
+      }, wait));
+      timers.push(setTimeout(done, wait + 250));
     }
     else if (step.t === 'opinion') {
       // The one provider's returned reply.
