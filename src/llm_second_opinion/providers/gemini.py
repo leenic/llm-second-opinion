@@ -34,12 +34,17 @@ from google import genai
 from google.genai import errors as genai_errors
 
 from .base import (
+    BackgroundPoll,
     Provider,
     ProviderError,
     SecondOpinionRequest,
     SecondOpinionResponse,
     TokenUsage,
 )
+
+# Interaction statuses that mean "still working" on a background interaction
+# (ai.google.dev/gemini-api/docs/background-execution, verified 2026-09-07).
+_NON_TERMINAL_STATUSES = frozenset({"queued", "in_progress"})
 
 
 class GeminiProvider(Provider):
@@ -95,13 +100,25 @@ class GeminiProvider(Provider):
         client = self._client()
 
         start = time.monotonic()
+        response = await self._call(
+            lambda: client.aio.interactions.create(**kwargs), self.timeout
+        )
+        latency_ms = int((time.monotonic() - start) * 1000)
+        return self._build_response(response, latency_ms)
+
+    async def _call(self, make_coro: Any, timeout: float) -> Any:
+        """Run one SDK call under `timeout` with its errors mapped to ProviderError.
+
+        The genai client takes no per-request timeout on this surface, so the
+        bound is `asyncio.wait_for`. `make_coro` is called inside the guard so
+        a synchronous raise from the SDK is mapped too.
+        """
         try:
-            coro = client.aio.interactions.create(**kwargs)
-            response = await asyncio.wait_for(coro, timeout=self.timeout)
+            return await asyncio.wait_for(make_coro(), timeout=timeout)
         except asyncio.TimeoutError as e:
             raise ProviderError(
                 "timeout",
-                f"gemini request timed out after {self.timeout}s",
+                f"gemini request timed out after {timeout}s",
                 retriable=True,
             ) from e
         except genai_errors.APIError as e:
@@ -113,8 +130,66 @@ class GeminiProvider(Provider):
                 retriable=False,
             ) from e
 
-        latency_ms = int((time.monotonic() - start) * 1000)
+    # -- background mode (design §2, §3.3; verified against the live docs) ---
+    #
+    # `background=True` makes create() return once the interaction is queued;
+    # it is then polled with `interactions.get(id=…)` and stopped with
+    # `interactions.cancel(id=…)`. Interactions are stored by default (paid
+    # tier: 55 days, free tier: 1 day) and `store=false` is incompatible with
+    # background execution, so nothing about storage is sent here.
 
+    supports_background = True
+
+    async def submit_background(self, req: SecondOpinionRequest, timeout: float) -> str:
+        kwargs = self._build_kwargs(req)
+        kwargs["background"] = True
+        client = self._client()
+        response = await self._call(lambda: client.aio.interactions.create(**kwargs), timeout)
+        upstream_id = getattr(response, "id", None)
+        if not upstream_id:
+            raise ProviderError(
+                "upstream_error",
+                f"gemini accepted the background interaction but returned no id "
+                f"to poll by (status={getattr(response, 'status', None)!r})",
+                retriable=True,
+            )
+        return str(upstream_id)
+
+    async def poll_background(self, upstream_id: str, timeout: float) -> BackgroundPoll:
+        client = self._client()
+        response = await self._call(lambda: client.aio.interactions.get(id=upstream_id), timeout)
+        status = getattr(response, "status", None)
+        if status in _NON_TERMINAL_STATUSES:
+            return BackgroundPoll(False, upstream_status=status)
+        if status == "requires_action":
+            # Paused for client tool input — nothing here will ever provide it.
+            return BackgroundPoll(
+                True,
+                error=ProviderError(
+                    "upstream_error",
+                    "gemini interaction paused waiting for client input "
+                    "(status=requires_action), which this server does not support",
+                    retriable=False,
+                ),
+                upstream_status=status,
+            )
+        try:
+            return BackgroundPoll(
+                True, response=self._build_response(response, 0), upstream_status=status
+            )
+        except ProviderError as e:
+            return BackgroundPoll(True, error=e, upstream_status=status)
+
+    async def cancel_background(self, upstream_id: str, timeout: float) -> None:
+        client = self._client()
+        await self._call(lambda: client.aio.interactions.cancel(id=upstream_id), timeout)
+
+    def _build_response(self, response: Any, latency_ms: int) -> SecondOpinionResponse:
+        """Validate a terminal Interaction and extract the final answer.
+
+        Shared by the synchronous path and the background poller, so the
+        status mappings are identical on both.
+        """
         status = getattr(response, "status", None)
         if status == "failed":
             raise ProviderError(

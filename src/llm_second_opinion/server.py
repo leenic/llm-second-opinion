@@ -1,20 +1,35 @@
-"""MCP server exposing `second_opinion` and `list_available_models` tools."""
+"""MCP server exposing `second_opinion`, `list_available_models` and the
+background-job tools `submit_second_opinion` / `get_second_opinion` /
+`cancel_second_opinion`."""
 
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import logging
 import time
 import uuid
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from mcp.server.fastmcp import FastMCP
 
+from . import jobs as jobs_mod
 from .config import (
     CLIENT_HARD_CAP_SECONDS,
     AppConfig,
     ConfigError,
     load_config,
+)
+from .jobs import (
+    BACKING_LOCAL_TASK,
+    BACKING_PROVIDER_BACKGROUND,
+    STATUS_CANCELLED,
+    STATUS_FAILED,
+    STATUS_SUCCEEDED,
+    JobRecord,
+    JobRegistry,
+    new_job_id,
+    retry_after_ms,
 )
 from .providers import (
     PROVIDER_TO_TARGET,
@@ -23,6 +38,7 @@ from .providers import (
     SecondOpinionRequest,
     build_provider,
 )
+from .providers.base import SecondOpinionResponse
 from .providers.gemini import GeminiProvider
 from .providers.grok import GrokProvider
 from .providers.openai_provider import OpenAIProvider
@@ -41,19 +57,65 @@ DEFAULT_SYSTEM_PROMPT = (
     "that aspect. State your confidence level when making factual claims."
 )
 
+# Tool descriptions are behavioural steering for the calling model (design
+# §3.4): they encode the polling protocol, because nothing server-side can
+# make a Desktop session poll sanely.
+SECOND_OPINION_DESCRIPTION = (
+    "Send a summary to an external LLM (Gemini, Grok, or ChatGPT) and "
+    "return its independent, critical second opinion. Best for quick "
+    "questions that finish well inside the per-call time cap. For "
+    "heavyweight reviews (large documents, web search, high reasoning "
+    "effort) use submit_second_opinion + get_second_opinion instead — they "
+    "run the review as a background job that is not bound by the per-call cap."
+)
 
-def build_server(config: AppConfig, logger: logging.Logger | None = None) -> FastMCP:
+SUBMIT_DESCRIPTION = (
+    "Start a second-opinion review from an external LLM (Gemini, Grok, or "
+    "ChatGPT) as a background job and return a job_id within seconds. Use "
+    "this for heavyweight reviews — large documents, web search, high "
+    "reasoning effort — that may take minutes. After submitting, call "
+    "get_second_opinion with wait_seconds=45; if the job is still running, "
+    "tell the user the review is in progress and poll again after "
+    "retry_after_ms or when the user asks — do not poll in a tight loop. "
+    "Pass a request_key (any unique string you choose) so that re-issuing "
+    "this call after a lost reply returns the same job instead of starting a "
+    "second, separately billed one. The synchronous second_opinion tool "
+    "remains better for quick questions."
+)
+
+GET_DESCRIPTION = (
+    "Check on, or wait for, a background review started with "
+    "submit_second_opinion. wait_seconds=0 returns the current status "
+    "immediately; wait_seconds=45 (the maximum) waits up to that long for "
+    "the job to finish before returning. A running result carries "
+    "retry_after_ms — wait at least that long before calling again, and tell "
+    "the user the review is in progress rather than polling in a tight loop. "
+    "A finished job returns the full second opinion, exactly as "
+    "second_opinion would, and can be re-read until it expires 30 minutes "
+    "after finishing. Abandoning or timing out this call never cancels the "
+    "job; only cancel_second_opinion does."
+)
+
+CANCEL_DESCRIPTION = (
+    "Cancel a background review started with submit_second_opinion, stopping "
+    "the upstream work. Cancelling a job that has already finished returns "
+    "its finished result rather than an error. This is the only way a job is "
+    "cancelled — abandoning get_second_opinion does not cancel anything."
+)
+
+
+def build_server(
+    config: AppConfig,
+    logger: logging.Logger | None = None,
+    registry: JobRegistry | None = None,
+) -> FastMCP:
     """Construct the FastMCP server. Separated from `main()` so tests can
     inspect or invoke tools without spawning a subprocess."""
     log = logger or logging.getLogger("llm_second_opinion")
     mcp = FastMCP("llm-second-opinion")
+    jobs = registry if registry is not None else JobRegistry(logger=log)
 
-    @mcp.tool(
-        description=(
-            "Send a summary to an external LLM (Gemini, Grok, or ChatGPT) and "
-            "return its independent, critical second opinion."
-        )
-    )
+    @mcp.tool(description=SECOND_OPINION_DESCRIPTION)
     async def second_opinion(
         summary: str,
         target_model: Literal["gemini", "grok", "chatgpt"],
@@ -200,6 +262,352 @@ def build_server(config: AppConfig, logger: logging.Logger | None = None) -> Fas
             "elapsed_ms": elapsed_ms(),
         }
 
+    @mcp.tool(description=SUBMIT_DESCRIPTION)
+    async def submit_second_opinion(
+        summary: str,
+        target_model: Literal["gemini", "grok", "chatgpt"],
+        focus: str | None = None,
+        system_prompt: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        request_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Start a background second-opinion job and return its job_id.
+
+        Then call get_second_opinion(job_id, wait_seconds=45). If it reports
+        status "running", tell the user the review is in progress and poll
+        again after retry_after_ms — never in a tight loop.
+
+        Args:
+            summary: The content to review. Required.
+            target_model: One of "gemini", "grok", or "chatgpt".
+            focus: Optional aspect to prioritise in the review.
+            system_prompt: Optional override for the default reviewer prompt.
+            temperature: Optional sampling temperature.
+            max_tokens: Optional maximum response length (tokens).
+            request_key: Optional idempotency key you choose. Re-submitting
+                with the same key returns the existing job instead of
+                starting a new one — use it so a retry after a lost reply
+                cannot start a second, separately billed review.
+        """
+        request_id = uuid.uuid4().hex[:12]
+        started = time.monotonic()
+
+        def elapsed_ms() -> int:
+            return int((time.monotonic() - started) * 1000)
+
+        if not isinstance(summary, str) or not summary.strip():
+            log.warning(
+                "rid=%s tool=submit_second_opinion outcome=error type=invalid_input "
+                "reason=empty_summary elapsed_ms=%d",
+                request_id, elapsed_ms(),
+            )
+            return _error_response(
+                request_id, target_model, "invalid_input",
+                "`summary` must be a non-empty string.", elapsed_ms=elapsed_ms(),
+            )
+
+        if request_key:
+            existing = jobs.find_by_key(request_key)
+            if existing is not None:
+                log.info(
+                    "rid=%s tool=submit_second_opinion outcome=deduplicated jid=%s "
+                    "status=%s elapsed_ms=%d",
+                    request_id, existing.job_id, existing.status, elapsed_ms(),
+                )
+                return _submit_result(request_id, existing, config, reused=True)
+
+        if jobs.at_capacity():
+            active = jobs.active()
+            listing = ", ".join(
+                f"jid={r.job_id} ({r.target_model}, {r.age_seconds():.0f}s old)"
+                for r in active
+            )
+            log.warning(
+                "rid=%s tool=submit_second_opinion outcome=error type=job_limit "
+                "active=%d elapsed_ms=%d",
+                request_id, len(active), elapsed_ms(),
+            )
+            return _error_response(
+                request_id, target_model, "job_limit",
+                f"The active-job cap ({jobs.max_active}) is reached. Wait for a "
+                f"job to finish or cancel one with cancel_second_opinion, then "
+                f"resubmit. Active jobs: {listing}.",
+                retriable=True, elapsed_ms=elapsed_ms(),
+            )
+
+        prompt = system_prompt if system_prompt and system_prompt.strip() else DEFAULT_SYSTEM_PROMPT
+
+        try:
+            provider = build_provider(target_model, config)
+        except ProviderError as e:
+            log.warning(
+                "rid=%s tool=submit_second_opinion target=%s outcome=error type=%s elapsed_ms=%d",
+                request_id, target_model, e.error_type, elapsed_ms(),
+            )
+            return _error_response(request_id, target_model, e.error_type, e.message,
+                                   retriable=e.retriable, elapsed_ms=elapsed_ms())
+
+        effective_max_tokens = max_tokens if max_tokens is not None else config.default_max_tokens
+        req = SecondOpinionRequest(
+            summary=summary,
+            focus=focus,
+            system_prompt=prompt,
+            temperature=temperature,
+            max_tokens=effective_max_tokens,
+        )
+
+        backing = (
+            BACKING_PROVIDER_BACKGROUND
+            if getattr(provider, "supports_background", False)
+            else BACKING_LOCAL_TASK
+        )
+        record = JobRecord(
+            job_id=new_job_id(),
+            provider=provider.name,
+            target_model=target_model,
+            model=provider.model_id(),
+            backing=backing,
+            reasoning_effort=getattr(provider, "reasoning_effort", None),
+            web_search=bool(getattr(provider, "web_search", False)),
+            max_tokens=effective_max_tokens,
+            focus=bool(focus),
+            request_key=request_key or None,
+            adapter=provider,
+        )
+        submit_budget = jobs_mod.SUBMIT_BUDGET_SECONDS
+        log.info(
+            "rid=%s tool=submit_second_opinion jid=%s provider=%s model=%s focus=%s "
+            "temp=%s max_tokens=%s effort=%s web_search=%s backing=%s "
+            "job_budget_s=%.1f submit_budget_s=%.1f",
+            request_id, record.job_id, provider.name, record.model,
+            "yes" if focus else "no", temperature, effective_max_tokens,
+            record.reasoning_effort, record.web_search, backing,
+            config.job_budget_seconds, submit_budget,
+        )
+        if config.log_prompts:
+            log.debug("rid=%s jid=%s prompt_summary=%r focus=%r",
+                      request_id, record.job_id, summary, focus)
+
+        if backing == BACKING_PROVIDER_BACKGROUND:
+            try:
+                upstream_id = await _run_bounded(
+                    provider.submit_background(req, timeout=submit_budget),
+                    submit_budget, log,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                took = elapsed_ms()
+                log.warning(
+                    "rid=%s tool=submit_second_opinion jid=%s provider=%s outcome=timeout "
+                    "elapsed_ms=%d submit_budget_s=%.1f",
+                    request_id, record.job_id, provider.name, took, submit_budget,
+                )
+                return _error_response(
+                    request_id, target_model, "timeout",
+                    f"{provider.name} did not acknowledge the background submission "
+                    f"within the {submit_budget:g}s submit budget. If the upstream "
+                    f"accepted it anyway, that work is orphaned (billed, but with no "
+                    f"handle to retrieve it). Retry — with a request_key so a retry "
+                    f"that does get through is not duplicated.",
+                    retriable=True, model=record.model, elapsed_ms=took,
+                )
+            except ProviderError as e:
+                log.warning(
+                    "rid=%s tool=submit_second_opinion jid=%s provider=%s outcome=error "
+                    "type=%s status=%s elapsed_ms=%d",
+                    request_id, record.job_id, provider.name, e.error_type, e.status,
+                    elapsed_ms(),
+                )
+                return _error_response(request_id, target_model, e.error_type, e.message,
+                                       retriable=e.retriable, model=record.model,
+                                       elapsed_ms=elapsed_ms())
+            except Exception as e:  # noqa: BLE001 - last-resort safety net
+                log.exception(
+                    "rid=%s tool=submit_second_opinion jid=%s provider=%s "
+                    "outcome=internal_error elapsed_ms=%d",
+                    request_id, record.job_id, provider.name, elapsed_ms(),
+                )
+                return _error_response(request_id, target_model, "internal_error", str(e),
+                                       retriable=False, model=record.model,
+                                       elapsed_ms=elapsed_ms())
+            if not upstream_id:
+                log.error(
+                    "rid=%s tool=submit_second_opinion jid=%s provider=%s "
+                    "outcome=internal_error reason=no_upstream_id elapsed_ms=%d",
+                    request_id, record.job_id, provider.name, elapsed_ms(),
+                )
+                return _error_response(
+                    request_id, target_model, "internal_error",
+                    f"{provider.name} acknowledged the submission without an id to "
+                    f"poll by; nothing was registered.",
+                    retriable=True, model=record.model, elapsed_ms=elapsed_ms(),
+                )
+            record.upstream_id = str(upstream_id)
+            jobs.register(record)
+            record.driver = asyncio.ensure_future(
+                _drive_background_job(record, jobs, config, log)
+            )
+        else:
+            jobs.register(record)
+            record.driver = asyncio.ensure_future(
+                _drive_local_job(record, req, jobs, config, log)
+            )
+
+        log.info(
+            "rid=%s tool=submit_second_opinion outcome=submitted jid=%s upstream_id=%s "
+            "backing=%s provider=%s model=%s elapsed_ms=%d",
+            request_id, record.job_id, record.upstream_id, backing, provider.name,
+            record.model, elapsed_ms(),
+        )
+        return _submit_result(request_id, record, config)
+
+    @mcp.tool(description=GET_DESCRIPTION)
+    async def get_second_opinion(
+        job_id: str,
+        wait_seconds: float = 0,
+    ) -> dict[str, Any]:
+        """Return a background job's status, or its finished second opinion.
+
+        Args:
+            job_id: The job_id returned by submit_second_opinion. Required.
+            wait_seconds: How long to wait for the job to finish before
+                returning. 0 (default) returns the current status at once;
+                the maximum is 45 — larger values are clamped, not rejected.
+        """
+        request_id = uuid.uuid4().hex[:12]
+        started = time.monotonic()
+
+        def elapsed_ms() -> int:
+            return int((time.monotonic() - started) * 1000)
+
+        record = jobs.get(job_id) if isinstance(job_id, str) else None
+        if record is None:
+            log.warning(
+                "rid=%s tool=get_second_opinion jid=%s outcome=error type=unknown_job "
+                "elapsed_ms=%d",
+                request_id, job_id, elapsed_ms(),
+            )
+            return _job_error_response(
+                request_id, job_id, "unknown_job", _unknown_job_message(job_id, jobs),
+                elapsed_ms=elapsed_ms(),
+            )
+
+        try:
+            wait = float(wait_seconds or 0)
+        except (TypeError, ValueError):
+            wait = 0.0
+        if wait < 0:
+            wait = 0.0
+        max_wait = jobs_mod.MAX_POLL_WAIT_SECONDS
+        if wait > max_wait:
+            log.warning(
+                "rid=%s tool=get_second_opinion jid=%s wait_seconds=%g clamped to %g",
+                request_id, record.job_id, wait, max_wait,
+            )
+            wait = max_wait
+
+        if not record.is_terminal and wait > 0:
+            try:
+                # Only the *wait* is bounded and discarded at the deadline;
+                # the job's poller is a separate task and is never touched
+                # from here (invariant 11).
+                await _run_bounded(record.done.wait(), wait, log)
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
+
+        return _job_status_result(
+            request_id, record, "get_second_opinion", elapsed_ms(), log,
+            extra_log=f" wait_s={wait:g}",
+        )
+
+    @mcp.tool(description=CANCEL_DESCRIPTION)
+    async def cancel_second_opinion(job_id: str) -> dict[str, Any]:
+        """Cancel a background job; returns its (now cancelled) state.
+
+        Args:
+            job_id: The job_id returned by submit_second_opinion. Required.
+        """
+        request_id = uuid.uuid4().hex[:12]
+        started = time.monotonic()
+
+        def elapsed_ms() -> int:
+            return int((time.monotonic() - started) * 1000)
+
+        record = jobs.get(job_id) if isinstance(job_id, str) else None
+        if record is None:
+            log.warning(
+                "rid=%s tool=cancel_second_opinion jid=%s outcome=error type=unknown_job "
+                "elapsed_ms=%d",
+                request_id, job_id, elapsed_ms(),
+            )
+            return _job_error_response(
+                request_id, job_id, "unknown_job", _unknown_job_message(job_id, jobs),
+                elapsed_ms=elapsed_ms(),
+            )
+
+        if record.is_terminal:
+            # Lost the race to a terminal transition: not an error, the
+            # finished state is the answer.
+            return _job_status_result(
+                request_id, record, "cancel_second_opinion", elapsed_ms(), log,
+                extra_log=" cancel=already_terminal",
+            )
+
+        if record.backing == BACKING_PROVIDER_BACKGROUND:
+            control = jobs_mod.SUBMIT_BUDGET_SECONDS
+            try:
+                await _run_bounded(
+                    record.adapter.cancel_background(record.upstream_id, timeout=control),
+                    control, log,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                log.warning(
+                    "rid=%s tool=cancel_second_opinion jid=%s upstream_id=%s "
+                    "outcome=timeout elapsed_ms=%d",
+                    request_id, record.job_id, record.upstream_id, elapsed_ms(),
+                )
+                return _job_error_response(
+                    request_id, record.job_id, "timeout",
+                    f"{record.provider} did not acknowledge the cancel within "
+                    f"{control:g}s; the job is still running. Retry "
+                    f"cancel_second_opinion.",
+                    retriable=True, elapsed_ms=elapsed_ms(),
+                )
+            except ProviderError as e:
+                log.warning(
+                    "rid=%s tool=cancel_second_opinion jid=%s upstream_id=%s "
+                    "outcome=error type=%s elapsed_ms=%d",
+                    request_id, record.job_id, record.upstream_id, e.error_type,
+                    elapsed_ms(),
+                )
+                return _job_error_response(
+                    request_id, record.job_id, e.error_type, e.message,
+                    retriable=e.retriable, elapsed_ms=elapsed_ms(),
+                )
+            except Exception as e:  # noqa: BLE001
+                log.exception(
+                    "rid=%s tool=cancel_second_opinion jid=%s outcome=internal_error "
+                    "elapsed_ms=%d", request_id, record.job_id, elapsed_ms(),
+                )
+                return _job_error_response(
+                    request_id, record.job_id, "internal_error", str(e),
+                    elapsed_ms=elapsed_ms(),
+                )
+            finished = jobs.finish(record, STATUS_CANCELLED, _cancelled_envelope(record))
+            if finished and record.driver is not None and not record.driver.done():
+                record.driver.cancel()
+        else:
+            finished = jobs.finish(record, STATUS_CANCELLED, _cancelled_envelope(record))
+            if finished and record.task is not None and not record.task.done():
+                # Same teardown discipline as the sync path: cancel, wait at
+                # most CANCEL_GRACE_SECONDS, abandon a task that ignores it.
+                await _abandon(record.task, log)
+
+        return _job_status_result(
+            request_id, record, "cancel_second_opinion", elapsed_ms(), log,
+            extra_log=" cancel=issued" if finished else " cancel=lost_race",
+        )
+
     @mcp.tool(
         description=(
             "Return the providers (gemini, grok, chatgpt) that are configured "
@@ -226,7 +634,10 @@ def build_server(config: AppConfig, logger: logging.Logger | None = None) -> Fas
 
 
 async def _run_bounded(
-    coro: Any, budget: float, log: logging.Logger | None = None
+    coro: Any,
+    budget: float,
+    log: logging.Logger | None = None,
+    on_start: Callable[[asyncio.Task], None] | None = None,
 ) -> Any:
     """Run `coro` under a hard wall-clock bound, raising TimeoutError if it
     overruns.
@@ -236,8 +647,14 @@ async def _run_bounded(
     straight back and the deadline is silently ignored — a late answer would
     surface as a success well past the point the MCP client had given up. Here
     the result is discarded unconditionally once the deadline passes.
+
+    `on_start` receives the task as soon as it exists, so a caller that may
+    need to cancel it from elsewhere (a background job's cancel tool) can keep
+    a handle without giving up this function's teardown discipline.
     """
     task = asyncio.ensure_future(coro)
+    if on_start is not None:
+        on_start(task)
     try:
         done, _pending = await asyncio.wait({task}, timeout=budget)
     except BaseException:
@@ -293,6 +710,307 @@ async def _abandon(task: asyncio.Task, log: logging.Logger | None = None) -> Non
         task.result()
     except (asyncio.CancelledError, Exception):  # noqa: BLE001
         pass
+
+
+# ---------------------------------------------------------------------------
+# Background-job drivers (design §7). One task per job, whichever backing.
+# Only these, `cancel_second_opinion`, and process shutdown ever stop upstream
+# work — a `get` waits on the record's event and never reaches in here.
+# ---------------------------------------------------------------------------
+
+
+async def _drive_background_job(
+    record: JobRecord, jobs: JobRegistry, config: AppConfig, log: logging.Logger
+) -> None:
+    """Poll a provider-backed job until terminal or the job budget expires."""
+    provider = record.adapter
+    upstream_id = record.upstream_id
+    try:
+        while not record.is_terminal:
+            budget = config.job_budget_seconds
+            remaining = budget - record.age_seconds()
+            if remaining <= 0:
+                await _cancel_upstream_quietly(record, log)
+                jobs.finish(record, STATUS_FAILED, _failed_envelope(
+                    record, "timeout", _job_timeout_message(record, budget), retriable=True,
+                ))
+                return
+
+            control = jobs_mod.SUBMIT_BUDGET_SECONDS
+            poll = None
+            try:
+                poll = await _run_bounded(
+                    provider.poll_background(upstream_id, timeout=control), control, log,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                log.warning(
+                    "jid=%s upstream_id=%s poll=timeout after %.0fs; retrying",
+                    record.job_id, upstream_id, control,
+                )
+            except ProviderError as e:
+                if e.retriable:
+                    log.warning(
+                        "jid=%s upstream_id=%s poll=error type=%s status=%s retriable; retrying",
+                        record.job_id, upstream_id, e.error_type, e.status,
+                    )
+                else:
+                    log.warning(
+                        "jid=%s upstream_id=%s poll=error type=%s status=%s; failing job",
+                        record.job_id, upstream_id, e.error_type, e.status,
+                    )
+                    jobs.finish(record, STATUS_FAILED, _failed_envelope(
+                        record, e.error_type, e.message, retriable=e.retriable,
+                    ))
+                    return
+
+            if record.is_terminal:
+                return  # cancelled while we were polling
+            if poll is not None and poll.done:
+                if poll.error is not None:
+                    jobs.finish(record, STATUS_FAILED, _failed_envelope(
+                        record, poll.error.error_type, poll.error.message,
+                        retriable=poll.error.retriable,
+                    ))
+                elif poll.response is not None:
+                    jobs.finish(record, STATUS_SUCCEEDED,
+                                _succeeded_envelope(record, poll.response))
+                else:
+                    jobs.finish(record, STATUS_FAILED, _failed_envelope(
+                        record, "internal_error",
+                        f"{record.provider} reported the job done "
+                        f"(upstream_status={poll.upstream_status!r}) with neither a "
+                        f"response nor an error.",
+                        retriable=False,
+                    ))
+                return
+
+            await asyncio.sleep(max(
+                0.0, min(jobs_mod.POLL_INTERVAL_SECONDS, budget - record.age_seconds())
+            ))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 - a driver must never die silently
+        log.exception("jid=%s upstream_id=%s job driver crashed", record.job_id, upstream_id)
+        jobs.finish(record, STATUS_FAILED, _failed_envelope(
+            record, "internal_error", str(e), retriable=False,
+        ))
+
+
+async def _drive_local_job(
+    record: JobRecord,
+    req: SecondOpinionRequest,
+    jobs: JobRegistry,
+    config: AppConfig,
+    log: logging.Logger,
+) -> None:
+    """Run the synchronous generate() path as an in-process task under the
+    job budget, with `_run_bounded`'s teardown discipline."""
+    provider = record.adapter
+    try:
+        response = await _run_bounded(
+            provider.generate(req), config.job_budget_seconds, log,
+            on_start=record.attach_task,
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        jobs.finish(record, STATUS_FAILED, _failed_envelope(
+            record, "timeout", _job_timeout_message(record, config.job_budget_seconds),
+            retriable=True,
+        ))
+    except asyncio.CancelledError:
+        # cancel_second_opinion abandons our task directly; the record is
+        # already terminal then. Anything else is a real cancellation
+        # (shutdown) and must propagate.
+        if record.is_terminal:
+            return
+        raise
+    except ProviderError as e:
+        jobs.finish(record, STATUS_FAILED, _failed_envelope(
+            record, e.error_type, e.message, retriable=e.retriable,
+        ))
+    except Exception as e:  # noqa: BLE001
+        log.exception("jid=%s local job driver crashed", record.job_id)
+        jobs.finish(record, STATUS_FAILED, _failed_envelope(
+            record, "internal_error", str(e), retriable=False,
+        ))
+    else:
+        jobs.finish(record, STATUS_SUCCEEDED, _succeeded_envelope(record, response))
+
+
+async def _cancel_upstream_quietly(record: JobRecord, log: logging.Logger) -> None:
+    """Best-effort upstream cancel on job-budget exhaustion; never raises."""
+    control = jobs_mod.SUBMIT_BUDGET_SECONDS
+    try:
+        await _run_bounded(
+            record.adapter.cancel_background(record.upstream_id, timeout=control),
+            control, log,
+        )
+        log.info("jid=%s upstream_id=%s cancel=issued reason=job_budget",
+                 record.job_id, record.upstream_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "jid=%s upstream_id=%s cancel=failed reason=job_budget error=%s",
+            record.job_id, record.upstream_id, e,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Result envelopes for the job tools
+# ---------------------------------------------------------------------------
+
+
+def _job_fields(record: JobRecord) -> dict[str, Any]:
+    return {
+        "job_id": record.job_id,
+        "target_model": record.target_model,
+        "provider": record.provider,
+        "model": record.model,
+        "backing": record.backing,
+    }
+
+
+def _submit_result(
+    request_id: str, record: JobRecord, config: AppConfig, reused: bool = False
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "success": True,
+        "request_id": request_id,
+        **_job_fields(record),
+        "status": record.status,
+        "job_budget_seconds": config.job_budget_seconds,
+        "poll_after_ms": 0 if record.is_terminal else retry_after_ms(0),
+    }
+    if reused:
+        out["reused_existing_job"] = True
+    return out
+
+
+def _succeeded_envelope(record: JobRecord, response: SecondOpinionResponse) -> dict[str, Any]:
+    """The SPEC §6.1 success shape, with latency measured across the job."""
+    job_ms = record.job_elapsed_ms()
+    return {
+        "success": True,
+        **_job_fields(record),
+        "provider": response.provider or record.provider,
+        "model": response.model or record.model,
+        "status": STATUS_SUCCEEDED,
+        "response": response.text,
+        "usage": response.usage.to_dict() if response.usage else None,
+        "latency_ms": job_ms,
+        "job_elapsed_ms": job_ms,
+    }
+
+
+def _failed_envelope(
+    record: JobRecord, error_type: str, message: str, retriable: bool
+) -> dict[str, Any]:
+    """The SPEC §6.1 error object, embedded in the job shape."""
+    return {
+        "success": False,
+        **_job_fields(record),
+        "status": STATUS_FAILED,
+        "error": {"type": error_type, "message": message, "retriable": retriable},
+        "job_elapsed_ms": record.job_elapsed_ms(),
+    }
+
+
+def _cancelled_envelope(record: JobRecord) -> dict[str, Any]:
+    return {
+        "success": True,
+        **_job_fields(record),
+        "status": STATUS_CANCELLED,
+        "cancelled_by": "cancel_second_opinion",
+        "cancelled_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        "job_elapsed_ms": record.job_elapsed_ms(),
+    }
+
+
+def _job_status_result(
+    request_id: str,
+    record: JobRecord,
+    tool: str,
+    elapsed_ms: int,
+    log: logging.Logger,
+    extra_log: str = "",
+) -> dict[str, Any]:
+    """Running status, or the cached terminal envelope, under a fresh request_id."""
+    if record.is_terminal and record.envelope is not None:
+        env = record.envelope
+        err = env.get("error")
+        outcome = (
+            f"error(type={err.get('type')})" if isinstance(err, dict)
+            else ("cancelled" if record.status == STATUS_CANCELLED else "ok")
+        )
+        log.info(
+            "rid=%s tool=%s jid=%s outcome=%s status=%s job_elapsed_ms=%d elapsed_ms=%d%s",
+            request_id, tool, record.job_id, outcome, record.status,
+            env.get("job_elapsed_ms", record.job_elapsed_ms()), elapsed_ms, extra_log,
+        )
+        out: dict[str, Any] = {"success": env.get("success", True), "request_id": request_id}
+        out.update(env)
+        out["elapsed_ms"] = elapsed_ms
+        return out
+
+    age = record.age_seconds()
+    log.info(
+        "rid=%s tool=%s jid=%s outcome=running job_elapsed_ms=%d elapsed_ms=%d%s",
+        request_id, tool, record.job_id, record.job_elapsed_ms(), elapsed_ms, extra_log,
+    )
+    return {
+        "success": True,
+        "request_id": request_id,
+        **_job_fields(record),
+        "status": record.status,
+        "job_elapsed_ms": record.job_elapsed_ms(),
+        "retry_after_ms": retry_after_ms(age),
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+def _job_timeout_message(record: JobRecord, budget: float) -> str:
+    return (
+        f"{record.provider} job exceeded the {budget:g}s job budget "
+        f"(job_budget_seconds) and was cancelled after {record.age_seconds():.0f}s. "
+        f"Retry with a narrower prompt, a lower reasoning_effort, web_search off, "
+        f"or a larger job_budget_seconds (env LLM_SECOND_OPINION_JOB_BUDGET) — "
+        f"the job budget is not subject to the MCP client's per-call cap."
+    )
+
+
+def _unknown_job_message(job_id: Any, jobs: JobRegistry) -> str:
+    return (
+        f"No job {job_id!r} is known to this server. Either the id is mistyped, "
+        f"the job finished more than {jobs.ttl_seconds / 60:.0f} minutes ago and its "
+        f"result was evicted (expired), or the server restarted since it was "
+        f"submitted. A restart loses the job registry: grok-backed jobs die with the "
+        f"process; chatgpt- and gemini-backed jobs finish (and are billed) upstream "
+        f"but their results are unreachable from here. Submit again."
+    )
+
+
+def _job_error_response(
+    request_id: str,
+    job_id: Any,
+    error_type: str,
+    message: str,
+    retriable: bool = False,
+    elapsed_ms: int | None = None,
+) -> dict[str, Any]:
+    """Error envelope for job tools where no target_model is known."""
+    out: dict[str, Any] = {
+        "success": False,
+        "request_id": request_id,
+        "job_id": job_id,
+        "error": {
+            "type": error_type,
+            "message": message,
+            "retriable": retriable,
+        },
+    }
+    if elapsed_ms is not None:
+        out["elapsed_ms"] = elapsed_ms
+    return out
 
 
 def _error_response(
@@ -417,9 +1135,10 @@ def main() -> None:
     ]
     logger.info(
         "starting llm-second-opinion MCP server (stdio). configured providers: %s. "
-        "request_budget_seconds=%.1f default_max_tokens=%s",
+        "request_budget_seconds=%.1f job_budget_seconds=%.1f default_max_tokens=%s",
         configured or "none",
         config.request_budget_seconds,
+        config.job_budget_seconds,
         config.default_max_tokens,
     )
 

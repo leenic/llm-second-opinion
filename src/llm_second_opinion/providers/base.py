@@ -19,6 +19,9 @@ ERROR_TYPES = {
     "content_blocked",
     "invalid_input",
     "internal_error",
+    # Background-job additions (DESIGN-submit-poll.md §8). Additive only.
+    "unknown_job",  # job_id not in the registry: typo, TTL eviction, or restart orphan
+    "job_limit",  # MAX_ACTIVE_JOBS reached; retriable once a job finishes
 }
 
 
@@ -83,14 +86,53 @@ class ProviderError(Exception):
         return out
 
 
+@dataclass
+class BackgroundPoll:
+    """One observation of a background job's upstream state.
+
+    `done=False` means still running. `done=True` carries exactly one of
+    `response` (the job succeeded) or `error` (the job reached a terminal
+    failure upstream — mapped through the same code as the synchronous path,
+    so the taxonomy is identical). A failure of the *poll call itself*
+    (network, auth, rate limit) is raised as `ProviderError` instead, so the
+    poller can tell "the job failed" from "I could not ask".
+    """
+
+    done: bool
+    response: SecondOpinionResponse | None = None
+    error: ProviderError | None = None
+    upstream_status: str | None = None
+
+
 class Provider(ABC):
     """Adapter for a single external LLM provider."""
 
     name: str = ""
 
+    # True when the vendor offers real background execution (submit -> id ->
+    # poll). Providers without it are run as in-process tasks by the server.
+    supports_background: bool = False
+
     @abstractmethod
     async def generate(self, req: SecondOpinionRequest) -> SecondOpinionResponse:
         """Send the second-opinion request and return the model's reply."""
+
+    async def submit_background(self, req: SecondOpinionRequest, timeout: float) -> str:
+        """Start the generation upstream and return the provider's id for it.
+
+        Must return as soon as the upstream acknowledges. `timeout` bounds
+        this one control call. Raises `ProviderError` on failure.
+        """
+        raise NotImplementedError(f"{self.name} has no background mode")
+
+    async def poll_background(self, upstream_id: str, timeout: float) -> BackgroundPoll:
+        """Observe the upstream job once. See `BackgroundPoll`."""
+        raise NotImplementedError(f"{self.name} has no background mode")
+
+    async def cancel_background(self, upstream_id: str, timeout: float) -> None:
+        """Cancel the upstream job. Idempotent: cancelling a finished job is
+        not an error."""
+        raise NotImplementedError(f"{self.name} has no background mode")
 
     @abstractmethod
     async def check_reachable(self) -> tuple[bool, str | None]:

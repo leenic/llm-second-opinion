@@ -24,6 +24,7 @@ from openai import (
 )
 
 from .base import (
+    BackgroundPoll,
     Provider,
     ProviderError,
     SecondOpinionRequest,
@@ -32,6 +33,11 @@ from .base import (
 )
 
 log = logging.getLogger(__name__)
+
+# Responses API statuses that mean "still working" on a background response
+# (developers.openai.com/api/docs/guides/background, verified 2026-09-07).
+# Everything else — completed, failed, incomplete, cancelled — is terminal.
+_NON_TERMINAL_STATUSES = frozenset({"queued", "in_progress"})
 
 # Sampling knobs we can drop and still answer the user's actual question.
 # Reasoning-only models reject these outright rather than ignoring them:
@@ -110,8 +116,20 @@ class ResponsesAPIProvider(Provider):
         client = self._client()
 
         start = time.monotonic()
+        response = await self._create_with_fallback(client, kwargs, start, self.timeout)
+        latency_ms = int((time.monotonic() - start) * 1000)
+        return self._build_response(response, latency_ms)
+
+    async def _create_with_fallback(
+        self, client: AsyncOpenAI, kwargs: dict[str, Any], start: float, budget: float
+    ) -> Any:
+        """`_create`, plus the one sanctioned retry without a rejected sampling knob.
+
+        Shared by the synchronous path and background submission: a 400 for
+        an unsupported parameter arrives synchronously either way.
+        """
         try:
-            response = await self._create(client, kwargs)
+            return await self._create(client, kwargs)
         except ProviderError as e:
             # A reasoning-only model rejects sampling knobs instead of ignoring
             # them, failing the whole call over a parameter that was only ever
@@ -128,7 +146,7 @@ class ResponsesAPIProvider(Provider):
             # up to 2x `timeout_seconds` — past the MCP client's ~240s cap,
             # which is the exact failure `max_retries=0` above exists to
             # prevent. Charge the retry only what's left.
-            remaining = self.timeout - (time.monotonic() - start)
+            remaining = budget - (time.monotonic() - start)
             if remaining <= 0:
                 raise
             log.warning(
@@ -136,21 +154,77 @@ class ResponsesAPIProvider(Provider):
                 self.name, self.model, dropped, remaining,
             )
             kwargs.pop(dropped)
-            response = await self._create(
-                client.with_options(timeout=remaining), kwargs
-            )
-
-        latency_ms = int((time.monotonic() - start) * 1000)
-        return self._build_response(response, latency_ms)
+            return await self._create(client.with_options(timeout=remaining), kwargs)
 
     async def _create(self, client: AsyncOpenAI, kwargs: dict[str, Any]) -> Any:
         """One call to the Responses API, with SDK errors mapped to ProviderError."""
+        return await self._mapped(client.responses.create(**kwargs), self.timeout)
+
+    # -- background mode (design §2, §3.3; verified against the live docs) ---
+    #
+    # `background: true` returns as soon as the response is queued; the
+    # response is then polled by id. `store: true` is sent explicitly because
+    # background responses are retained beyond a ~10-minute window only when
+    # stored (Zero-Data-Retention projects run background with store=false).
+    # Cancel is `POST /v1/responses/{id}/cancel`, idempotent: cancelling a
+    # finished response just returns it.
+
+    supports_background = True
+
+    async def submit_background(self, req: SecondOpinionRequest, timeout: float) -> str:
+        kwargs = self._build_kwargs(req)
+        kwargs["background"] = True
+        kwargs["store"] = True
+        client = self._client().with_options(timeout=timeout)
+        start = time.monotonic()
+        response = await self._create_with_fallback(client, kwargs, start, timeout)
+        upstream_id = getattr(response, "id", None)
+        if not upstream_id:
+            raise ProviderError(
+                "upstream_error",
+                f"{self.name} accepted the background request but returned no "
+                f"response id to poll by (status={getattr(response, 'status', None)!r})",
+                retriable=True,
+            )
+        return str(upstream_id)
+
+    async def poll_background(self, upstream_id: str, timeout: float) -> BackgroundPoll:
+        client = self._client().with_options(timeout=timeout)
+        response = await self._mapped(client.responses.retrieve(upstream_id), timeout)
+        status = getattr(response, "status", None)
+        if status in _NON_TERMINAL_STATUSES:
+            return BackgroundPoll(False, upstream_status=status)
+        if status == "cancelled":
+            return BackgroundPoll(
+                True,
+                error=ProviderError(
+                    "upstream_error",
+                    f"{self.name} response was cancelled upstream",
+                    retriable=False,
+                ),
+                upstream_status=status,
+            )
+        # Terminal: the exact payload the synchronous path validates, through
+        # the same code — failed/incomplete/refusal/empty mappings are shared.
         try:
-            return await client.responses.create(**kwargs)
+            return BackgroundPoll(
+                True, response=self._build_response(response, 0), upstream_status=status
+            )
+        except ProviderError as e:
+            return BackgroundPoll(True, error=e, upstream_status=status)
+
+    async def cancel_background(self, upstream_id: str, timeout: float) -> None:
+        client = self._client().with_options(timeout=timeout)
+        await self._mapped(client.responses.cancel(upstream_id), timeout)
+
+    async def _mapped(self, awaitable: Any, timeout: float) -> Any:
+        """Await one SDK call with its exceptions mapped to ProviderError."""
+        try:
+            return await awaitable
         except APITimeoutError as e:
             raise ProviderError(
                 "timeout",
-                f"{self.name} request timed out after {self.timeout}s",
+                f"{self.name} request timed out after {timeout}s",
                 retriable=True,
             ) from e
         except AuthenticationError as e:

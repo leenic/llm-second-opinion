@@ -57,6 +57,18 @@ BUDGET_WARN_THRESHOLD_SECONDS = 235.0
 # they hit the deadline before the cap.
 DEFAULT_MAX_TOKENS = 32000
 
+# Wall-clock bound on one background *job* (submit_second_opinion), which
+# lives independently of any tool call and is therefore not subject to the
+# MCP client's per-call cap. 900s is ~4.5x the worst genuine workload
+# observed (a full-document review with web search that died at 200s under
+# the synchronous tool) while still bounding runaway vendor spend.
+DEFAULT_JOB_BUDGET_SECONDS = 900.0
+
+# Above this, warn: vendor-side background retention windows make very long
+# jobs fragile (OpenAI keeps unstored background responses only ~10 minutes;
+# stored ones follow the account's retention policy). Honoured, never clamped.
+JOB_BUDGET_WARN_THRESHOLD_SECONDS = 3600.0
+
 REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
 
 
@@ -79,6 +91,10 @@ class AppConfig:
     request_budget_seconds: float = DEFAULT_REQUEST_BUDGET_SECONDS
     # Cap applied when the caller passes no `max_tokens`. None = unbounded.
     default_max_tokens: int | None = DEFAULT_MAX_TOKENS
+    # Bounds one background job — see DEFAULT_JOB_BUDGET_SECONDS. Governs
+    # only the submit/poll tools; `request_budget_seconds` still governs the
+    # synchronous tool alone.
+    job_budget_seconds: float = DEFAULT_JOB_BUDGET_SECONDS
     log_prompts: bool = False
     log_level: str = "INFO"
     config_path: Path | None = None
@@ -183,6 +199,7 @@ def load_config() -> AppConfig:
 
     warnings: list[str] = []
     request_budget_seconds = _load_request_budget(raw, warnings)
+    job_budget_seconds = _load_job_budget(raw, warnings)
     default_max_tokens = _load_default_max_tokens(raw)
 
     log_prompts = bool(raw.get("log_prompts", False))
@@ -194,6 +211,7 @@ def load_config() -> AppConfig:
     return AppConfig(
         providers=providers,
         request_budget_seconds=request_budget_seconds,
+        job_budget_seconds=job_budget_seconds,
         default_max_tokens=default_max_tokens,
         log_prompts=log_prompts,
         log_level=log_level,
@@ -246,6 +264,32 @@ def _load_request_budget(raw: dict, warnings: list[str]) -> float:
             f"{CLIENT_HARD_CAP_SECONDS}s cap Claude Desktop enforces on tool "
             f"calls; Desktop will cancel the call and discard the result "
             f"before this budget fires. Use ~200 or lower."
+        )
+    return budget
+
+
+def _load_job_budget(raw: dict, warnings: list[str]) -> float:
+    """Resolve the per-job budget: env `LLM_SECOND_OPINION_JOB_BUDGET` beats
+    the file's `job_budget_seconds`, which beats the default."""
+    value = raw.get("job_budget_seconds")
+    env_value = os.environ.get(f"{ENV_PREFIX}JOB_BUDGET")
+    if env_value:
+        value = env_value
+
+    if value is None:
+        return DEFAULT_JOB_BUDGET_SECONDS
+    try:
+        budget = float(value)
+    except (TypeError, ValueError) as e:
+        raise ConfigError(f"Invalid job_budget_seconds: {value!r}") from e
+    if budget <= 0:
+        raise ConfigError("job_budget_seconds must be > 0")
+    if budget > JOB_BUDGET_WARN_THRESHOLD_SECONDS:
+        warnings.append(
+            f"job_budget_seconds={budget} is above {JOB_BUDGET_WARN_THRESHOLD_SECONDS:g}s; "
+            f"vendor-side background retention windows make very long jobs "
+            f"fragile (OpenAI keeps background responses for a limited window). "
+            f"Honoured as set, but prefer a smaller value."
         )
     return budget
 

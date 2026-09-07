@@ -1,6 +1,11 @@
 # llm-second-opinion — System Specification
 
-**Version:** 0.1.0 · **Status:** current as of 2026-08-28 · **Audience:** contributors extending the server
+**Version:** 0.2.0 · **Status:** current as of 2026-09-07 · **Audience:** contributors extending the server
+
+> **0.2.0 amendment.** The submit/poll background-job extension specified in
+> [DESIGN-submit-poll.md](DESIGN-submit-poll.md) has landed. This document has been amended where the
+> extension touches it (§3, §5, §6.4, §8.2, §9, §10, §12–§16); the design document remains the authoritative
+> rationale for the job subsystem and is not repeated here.
 
 This document specifies what the application *does today*, precisely enough to serve as the foundation for
 extensions. It is derived from an exhaustive review of the codebase (all source, tests, configuration, packaging,
@@ -49,9 +54,10 @@ This is enforced by tests (§14).
 
 | Path | Role |
 |---|---|
-| `src/llm_second_opinion/__init__.py` | Package marker; `__version__ = "0.1.0"` |
+| `src/llm_second_opinion/__init__.py` | Package marker; `__version__ = "0.2.0"` |
 | `src/llm_second_opinion/__main__.py` | `python -m llm_second_opinion` entry point |
-| `src/llm_second_opinion/server.py` | FastMCP server, both tools, timing/cancellation logic, error envelope |
+| `src/llm_second_opinion/server.py` | FastMCP server, all five tools, timing/cancellation logic, the background-job drivers, error envelopes |
+| `src/llm_second_opinion/jobs.py` | Background-job record, state machine, in-memory registry with `request_key` index and lazy TTL eviction, timing-model-v2 constants (no asyncio driving code) |
 | `src/llm_second_opinion/config.py` | Config file discovery, env overrides, validation, defaults, constants |
 | `src/llm_second_opinion/logging_setup.py` | Stderr-only logger configuration |
 | `src/llm_second_opinion/providers/base.py` | Provider ABC, request/response/usage dataclasses, `ProviderError`, error taxonomy |
@@ -65,8 +71,9 @@ This is enforced by tests (§14).
 | `docs/index.html` | Self-contained GitHub Pages intro page with an animated demo re-enactment |
 | `pyproject.toml` | Hatchling build; console script; pytest config |
 
-**Dependencies:** `mcp>=1.2.0`, `openai>=2.36,<3`, `google-genai>=2.0,<3`. Dev: `pytest>=8.0`,
-`pytest-asyncio>=0.23` (strict asyncio mode). Requires Python ≥ 3.10. License MIT.
+**Dependencies:** `mcp>=1.2.0,<2` (2.x renamed `FastMCP` and changed the tool API), `openai>=2.36,<3`,
+`google-genai>=2.0,<3`. Dev: `pytest>=8.0`, `pytest-asyncio>=0.23` (strict asyncio mode). Requires Python
+≥ 3.10. License MIT.
 
 ## 4. Runtime and process model
 
@@ -85,9 +92,10 @@ This is enforced by tests (§14).
    handler elsewhere can never reach stdout). Idempotent on re-call (hot-reload safe).
 3. Deferred config warnings (collected during `load_config`, which runs before logging exists) are emitted now.
 4. Startup summary logged: config path (or the four searched locations), configured providers (as *target*
-   names), `request_budget_seconds`, `default_max_tokens`.
-5. `build_server(config, logger)` constructs `FastMCP("llm-second-opinion")` with both tools registered;
-   `server.run()` serves MCP over stdio.
+   names), `request_budget_seconds`, `job_budget_seconds`, `default_max_tokens`.
+5. `build_server(config, logger, registry=None)` constructs `FastMCP("llm-second-opinion")` with all five
+   tools registered and one `JobRegistry` (a fresh one unless a test injects its own); `server.run()` serves
+   MCP over stdio.
 
 `build_server` is deliberately separated from `main()` so tests can invoke tools in-process via
 `server.call_tool(...)` without a subprocess.
@@ -122,6 +130,7 @@ Top-level:
 | Field | Resolution | Validation / semantics |
 |---|---|---|
 | `request_budget_seconds` | env `…_REQUEST_BUDGET` or legacy `…_TIMEOUT` → file `request_budget_seconds` (wins over legacy `timeout_seconds`; both present ⇒ warning) → **200.0** | Float > 0 else `ConfigError`. Value ≥ **235** produces a warning (Desktop's 240 s cap would fire first) but is **honoured, never clamped** — another MCP client may allow longer. §10 explains the model. |
+| `job_budget_seconds` | env `…_JOB_BUDGET` → file `job_budget_seconds` → **900.0** | Float > 0 else `ConfigError`. Value > **3600** produces a warning (vendor-side background retention windows make very long jobs fragile) but is honoured. Governs only the background-job tools (§6.4); `request_budget_seconds` continues to govern only the synchronous tool. |
 | `default_max_tokens` | env `…_DEFAULT_MAX_TOKENS` (`""`/`none`/`null` ⇒ unbounded) → file key **if present** (explicit JSON `null` ⇒ unbounded — distinct from an absent key) → **32000** | Int > 0 or null else `ConfigError`. §11 explains the choice of 32000. |
 | `log_prompts` | env `…_LOG_PROMPTS` → file boolean → `False` | Gates DEBUG lines carrying prompt/response content |
 | `log_level` | env `…_LOG_LEVEL` only → `INFO` | Uppercased. **No config-file field exists for this** — env only. |
@@ -141,13 +150,24 @@ or above the warn threshold); `main()` logs them once the logger exists.
 | `BUDGET_WARN_THRESHOLD_SECONDS` | 235.0 | Budget at/above this is warned about |
 | `DEFAULT_MAX_TOKENS` | 32000 | Reply cap when the caller passes no `max_tokens` |
 | `REASONING_EFFORTS` | `{minimal, low, medium, high}` | Accepted effort values (shared enum across all three providers) |
+| `DEFAULT_JOB_BUDGET_SECONDS` | 900.0 | Wall-clock bound on one background job (not subject to the client cap) |
+| `JOB_BUDGET_WARN_THRESHOLD_SECONDS` | 3600.0 | Job budget above this is warned about |
 | `CANCEL_GRACE_SECONDS` (in `server.py`) | 5.0 | Teardown window for a cancelled provider task; budget + grace must clear the client cap (200 + 5 < 240) |
+
+Job constants (in `jobs.py`, design §10): `SUBMIT_BUDGET_SECONDS = 30.0` (bounds submit, poll and cancel
+control calls), `MAX_POLL_WAIT_SECONDS = 45.0`, `POLL_INTERVAL_SECONDS = 4.0`, `MAX_ACTIVE_JOBS = 8`,
+`TERMINAL_JOB_TTL_SECONDS = 1800.0`.
 
 ## 6. MCP interface
 
-Server name: `llm-second-opinion`. Two tools. Tool schemas are derived by FastMCP from the Python signatures —
-the `Literal["gemini", "grok", "chatgpt"]` annotation is what advertises the allowed `target_model` values to
-the client, and the docstring `Args:` entries feed the parameter descriptions.
+Server name: `llm-second-opinion`. Five tools: the synchronous `second_opinion` (§6.1), `list_available_models`
+(§6.2), and the background-job trio `submit_second_opinion` / `get_second_opinion` / `cancel_second_opinion`
+(§6.4). Tool schemas are derived by FastMCP from the Python signatures — the `Literal["gemini", "grok",
+"chatgpt"]` annotation is what advertises the allowed `target_model` values to the client, and the docstring
+`Args:` entries feed the parameter descriptions. The tool *descriptions* are behavioural steering for the
+calling model (design §3.4): the sync tool's points heavyweight reviews at the job tools, and the job tools'
+encode the polling protocol (wait 45 s, then report progress and poll after `retry_after_ms`, never in a
+tight loop).
 
 ### 6.1 `second_opinion`
 
@@ -265,10 +285,61 @@ Behaviour (`_check_all_providers`):
 Defined in `providers/base.py::ERROR_TYPES`; values are **stable API** (Claude may show them verbatim):
 
 `missing_api_key` · `auth_failed` · `rate_limit` · `timeout` · `network_error` · `upstream_error` ·
-`bad_request` · `content_blocked` · `invalid_input` · `internal_error`
+`bad_request` · `content_blocked` · `invalid_input` · `internal_error` · `unknown_job` (0.2.0: job_id not
+in the registry — typo, TTL eviction, or post-restart orphan; not retriable) · `job_limit` (0.2.0:
+`MAX_ACTIVE_JOBS` reached; retriable, message lists the active jobs)
 
 `ProviderError(error_type, message, retriable=False, status=None)` coerces any unknown type to
 `internal_error` at construction, so a typo in an adapter can never leak a novel type to the client.
+
+### 6.4 Background-job tools (0.2.0)
+
+Contracts, result shapes and rationale are specified in [DESIGN-submit-poll.md](DESIGN-submit-poll.md) §3–§8;
+this section records what was built.
+
+- **`submit_second_opinion`** — `second_opinion`'s arguments plus `request_key: str | None`. Validates
+  `summary` and resolves the provider exactly as §6.1 steps 1–4 (same `invalid_input` / `missing_api_key`
+  envelopes, same `default_max_tokens` rule). Then: a `request_key` that matches a known job (running *or*
+  terminal, until eviction) returns that job's submit shape with `"reused_existing_job": true` and no upstream
+  call; the active-job cap returns `job_limit`; otherwise a `JobRecord` is created and started per the
+  provider's backing. Provider-backed (`supports_background`): `provider.submit_background(req, timeout=30)`
+  under `_run_bounded(…, SUBMIT_BUDGET_SECONDS)`; a timeout returns a `timeout` envelope whose message says the
+  work may be orphaned and to retry with a `request_key`; the job is registered only once the upstream id is
+  in hand, so `submitting` is never observed. Local-task (grok): registered immediately and the driver starts
+  `generate(req)`. Success shape: `success, request_id, job_id, target_model, provider, model, backing,
+  status, job_budget_seconds, poll_after_ms`. Two identical submits that overlap in time (the first not yet
+  acknowledged) both create jobs — the key is indexed at registration; the race the key guards is the
+  *lost-reply retry*, which arrives after registration.
+- **`get_second_opinion(job_id, wait_seconds=0)`** — unknown id ⇒ `unknown_job` (message names the three
+  causes and the restart consequence per backing). `wait_seconds` is clamped to `[0, 45]` with a warning above
+  the cap. A positive wait on a running job awaits the record's `done` event under `_run_bounded`; the wait,
+  and only the wait, is discarded at the deadline. Running result: the submit fields plus `job_elapsed_ms`
+  and `retry_after_ms` (5 s under 60 s of age, 15 s under 300 s, then 30 s). Terminal result: the cached
+  envelope (`status` `succeeded` with the §6.1 success fields — `latency_ms` measured across the job — or
+  `failed` with the §6.1 `error` object, or `cancelled` with `cancelled_by`/`cancelled_at`) plus this call's
+  `request_id` and `elapsed_ms`, identical on every re-read until eviction.
+- **`cancel_second_opinion(job_id)`** — unknown ⇒ `unknown_job`; terminal ⇒ the terminal state (not an error).
+  Provider-backed: `provider.cancel_background(upstream_id, timeout=30)` under `_run_bounded`; a failure of
+  that call is returned as its error and the job stays running. Then the record moves to `cancelled` and the
+  driver task is cancelled. Local-task: the record moves to `cancelled` and the generate task is torn down with
+  `_abandon` (cancel, wait at most `CANCEL_GRACE_SECONDS`, log and leave a task that ignores cancellation).
+
+**Drivers.** Every job has one driver task, started at registration, and it is the *only* thing that talks to
+the upstream job after submission. Provider-backed: loop — if `age > job_budget_seconds`, best-effort upstream
+cancel and `failed(timeout)`; else `poll_background` bounded at `SUBMIT_BUDGET_SECONDS` (a poll-call timeout
+or a *retriable* `ProviderError` is logged and retried next interval; a non-retriable one fails the job);
+a `done` poll finishes the job with the response or the mapped error; otherwise sleep
+`min(POLL_INTERVAL_SECONDS, remaining budget)`. Local-task: `_run_bounded(generate(req), job_budget_seconds,
+on_start=record.attach_task)` — the same machinery as the sync path with the larger budget, so a task that
+ignores cancellation is abandoned with the existing log line. A driver never surfaces an exception: any
+unexpected one fails the job with `internal_error`. Consequence for the timing model: the job budget is
+enforced whether or not anyone polls, and a `get` never touches upstream — it waits on an event.
+
+**Registry (`jobs.py`).** `dict[job_id → JobRecord]` plus `request_key → job_id`; terminal transitions are
+immutable (`finish` returns `False` for a second attempt, so whoever loses a cancel/complete race observes the
+winner's state); terminal records are swept lazily on every access once older than
+`TERMINAL_JOB_TTL_SECONDS`; running records are never evicted. `job_id = uuid4().hex[:12]` — the `request_id`
+grammar in its own value space; provider ids are held as `upstream_id`, logged, never returned.
 
 ## 7. Prompt construction
 
@@ -310,6 +381,19 @@ Every adapter implements:
   guard).
 - `model_id() -> str` — the configured model name.
 - Class attribute `name` — the provider key used in config and logs.
+
+Background mode (0.2.0) is optional per adapter, declared by the class attribute `supports_background`
+(default `False`, in which case the server runs jobs as local tasks over `generate`). Adapters that set it
+implement three *control calls*, each bounded by the `timeout` argument they receive:
+
+- `async submit_background(req, timeout) -> str` — start the generation upstream, return the provider's id as
+  soon as it is acknowledged; raises `ProviderError` on failure.
+- `async poll_background(upstream_id, timeout) -> BackgroundPoll` — one observation. `BackgroundPoll(done,
+  response, error, upstream_status)`: `done=False` while running; `done=True` with exactly one of `response`
+  (succeeded) or `error` (a terminal upstream failure, mapped through **the same code as the synchronous
+  path**). A failure of the poll call *itself* (network, auth, rate limit) is *raised* as `ProviderError`
+  instead, so the driver can tell "the job failed" from "I could not ask".
+- `async cancel_background(upstream_id, timeout) -> None` — idempotent.
 
 All adapters share the constructor signature
 `(api_key, model, timeout, reasoning_effort=None, web_search=False)` — the factory and the reachability checker
@@ -379,6 +463,22 @@ tool call instead (errors carry `retriable`).
   empty "success" is never returned.
 - Otherwise: success. `model` = `response.model` or the configured name; usage extracted including
   `output_tokens_details.reasoning_tokens`.
+
+**Structure (0.2.0):** `generate` = `_build_kwargs` → `_create_with_fallback` (one `_create`, plus the §9.3
+retry) → `_build_response`. `_create` delegates to `_mapped(awaitable, timeout)`, which holds the SDK error
+mapping above, so the background control calls share it verbatim.
+
+**Background mode (`OpenAIProvider`, `supports_background = True`):** `submit_background` sends
+`_build_kwargs(req)` plus `background: true` and `store: true` (explicit — unstored background responses are
+retained only ~10 minutes; stored ones follow the account's retention policy) through `_create_with_fallback`
+on a client bound to the control timeout, and returns `response.id`. `poll_background` calls
+`responses.retrieve(id)`: status `queued`/`in_progress` ⇒ running; `cancelled` ⇒ terminal `upstream_error`;
+anything else is passed to `_build_response` so `failed`/`incomplete`/refusal/empty map exactly as on the
+sync path. `cancel_background` calls `responses.cancel(id)` (idempotent upstream). `GrokProvider` sets
+`supports_background = False` and must keep it: live on 2026-09-07 xAI rejected `background: true` with
+`400 Argument not supported`, and a stored streaming response whose connection was closed after
+`response.created` was never retrievable (404 through 90 s), so there is no store-and-retrieve path either
+(design §12.1). Grok jobs run as local tasks.
 
 ### 9.2 Final-answer extraction (`_final_message_text`) — **invariant**
 
@@ -450,6 +550,15 @@ model-output text, a non-text block after collecting is a barrier).
 
 No droppable-param retry exists on this path (`gemini-3.6-flash` accepts `temperature`).
 
+**Structure (0.2.0):** `generate` = `_build_kwargs` → `_call(make_coro, timeout)` (the `wait_for` bound and
+the error mapping above; the coroutine is created inside the guard) → `_build_response` (the status mapping,
+text extraction, usage and model id above). **Background mode (`supports_background = True`):**
+`submit_background` adds `background: true` (interactions are stored by default and `store=false` is
+documented as incompatible with background execution, so nothing about storage is sent) and returns
+`response.id`; `poll_background` calls `interactions.get(id=…)`: `queued`/`in_progress` ⇒ running;
+`requires_action` ⇒ terminal `upstream_error` (nothing here can supply client input); anything else through
+`_build_response`. `cancel_background` calls `interactions.cancel(id=…)`.
+
 ## 10. Timing and cancellation model
 
 This is the most safety-critical subsystem. The forcing constraint: **Claude Desktop enforces a hard,
@@ -486,6 +595,47 @@ exists to get in front of that cap and return a structured, actionable result in
 
 **Post-conditions** (all test-pinned): a timeout never wedges the server for the next request; no pending tasks
 survive a handler return; subsequent calls succeed normally.
+
+### 10.1 Observed failure modes (Aug 21 – Sep 5, 2026)
+
+Live diagnosis of the model above, recorded in full in DESIGN-submit-poll.md §1, established:
+
+1. **The structured server timeout is real but workload-specific.** A full-document review (large prompt
+   ingestion × web-search loop × long multi-part output) breaches 200 s deterministically on `gpt-5.6-sol` at
+   `medium` effort — `rid=0533d5147482`, `outcome=timeout`, `elapsed_ms=200015`, the first timeout outcome in
+   the server's log history. The same configuration on a 600-word prompt took 161 s.
+2. **The client-side four-minute hang can be pure dispatch loss.** A call can die with zero traces in either
+   the bridge log or the server log — never dispatched, no upstream cost — after an idle gap on the
+   claude.ai → Desktop bridge path. The identical call re-fired seconds after a successful liveness probe
+   (`list_available_models`) succeeded in 56.7 s. Hence the *probe-then-fire* habit documented in USAGE.
+3. **The three-layer budget machinery works end-to-end in production:** finding 1's envelope crossed the
+   relay with ~40 s of headroom.
+4. **A synchronous timeout burns unrecoverable money.** On a synchronous create the upstream id arrives only
+   with the response, so a 200 s cancelled call is billed work with no handle to retrieve it by.
+5. **Cost concentrates in search ingestion, not generation** (grok: 390,151 input tokens in 56.7 s; gpt:
+   118,501 in 161 s), and latency does not scale with it.
+
+Consequences: heavy workloads must escape the per-call envelope entirely; every individual tool call must be
+short because the relay can eat one; upstream work must survive the client and the relay. That is the
+background-job extension.
+
+### 10.2 Timing model v2 (0.2.0)
+
+The three-layer model is retained *per tool call* with per-tool budgets, and a **job** gets its own clock:
+
+| Tool call | Budget | Grace | Worst case | Headroom vs 240 s cap |
+|---|---|---|---|---|
+| `submit_second_opinion` | `SUBMIT_BUDGET_SECONDS = 30` | 5 | 35 s | 205 s |
+| `get_second_opinion` | `wait_seconds ≤ 45` (+ ~1 s) | 5 | ~51 s | ~189 s |
+| `cancel_second_opinion` | 30 | 5 | 35 s | 205 s |
+| `second_opinion` (sync) | `request_budget_seconds` (200) | 5 | 205 s | 35 s (grandfathered) |
+
+`job_budget_seconds` (default 900) is enforced by the job's driver task (§6.4) for both backings: the
+provider-backed poller cancels upstream and moves the job to `failed(timeout)`; the local-task driver reuses
+`_run_bounded` with the job budget, including `_abandon`'s bounded teardown. A `get` call's own deadline
+discards only its wait. **Cancellation is inverted for jobs:** the v0.1 rule "cancel on outer cancellation so a
+billable call is not left running unmanaged" applies to the *wait* inside `get` (which owns nothing upstream)
+but never to the job — background work decoupled from any listener is the point (invariant 11).
 
 ## 11. Reply-length model
 
@@ -524,6 +674,12 @@ gpt ~21 s (`medium`), grok ~44–50 s (`high`); a long open-ended prompt pushes 
 
   `outcome` ∈ `ok | timeout | error(type=…)`. This keeps the latency distribution measurable straight from the
   Desktop log.
+- **Jobs (0.2.0):** the `rid=` grammar is extended, never changed. Every job-related line carries `jid=`;
+  submit logs `outcome=submitted jid=… upstream_id=… backing=…`; get/cancel log
+  `outcome=running|ok|cancelled|error(type=…) jid=… job_elapsed_ms=…`; the registry logs lifecycle lines
+  `jid=… job=terminal status=…` and `jid=… job=evicted`; the poller logs `jid=… upstream_id=… poll=…` on
+  retries. `upstream_id` appears in logs only, never in tool results. One `request_id` per tool call, one
+  `job_id` per job; a job accumulates many `rid`s over its life.
 - Prompt and response **content** is logged only at DEBUG and only when `log_prompts` is enabled (off by
   default — the content may be sensitive).
 
@@ -533,7 +689,14 @@ gpt ~21 s (`medium`), grok ~44–50 s (`high`); a long open-ended prompt pushes 
   results.
 - Only the caller-supplied `summary` (plus focus/system prompt) leaves the machine, to the one chosen vendor.
   No history, no repo access, nothing persisted server-side ("0 conversation data stored" is a public claim on
-  the docs page).
+  the docs page — *by the server*).
+- **Background jobs move data custody (0.2.0).** Background execution requires the vendor to store the request
+  and response: OpenAI stored responses (sent with `store: true`) persist under the account's retention
+  policy; Google interactions are stored by default (55 days paid tier, 1 day free tier) and `store=false` is
+  incompatible with background execution. The docs state this plainly and point at the synchronous tool when
+  it is unacceptable. Grok-backed jobs are an ordinary API call and store nothing beyond it. Job records hold
+  prompt-adjacent metadata in memory (model, effort, `web_search`, `max_tokens`, whether a focus was given) —
+  never content — and `log_prompts` continues to gate every content log line.
 - No inbound network surface: stdio only, spawned by the MCP host.
 - The server trusts its single local user; there is no auth/tenancy of its own (v1 scope).
 
@@ -566,6 +729,24 @@ What each module pins:
   guards (params omitted unless set; forwarded when set; Grok base URL), the entire droppable-param retry
   contract (§9.3) including remaining-budget charging and single-retry limit, and terminal statuses
   (`incomplete`/`failed` mappings).
+- `test_jobs.py` (0.2.0) — the registry and state machine (transitions, terminal immutability, key index,
+  capacity, lazy eviction with `jid=` log line, the design constants and the per-tool headroom under the
+  cap); the tool path through the real FastMCP tools with a `BackgroundStub` whose lifecycle the test drives
+  and the v0.1 `StubProvider` for local tasks: submit shape and bound, request built like the sync path,
+  idempotent `request_key` (one upstream create), submit-side errors and the 30 s submit timeout, `get` with
+  `wait_seconds=0` / long-poll early return / clamp warning, the get-deadline-discards-only-the-wait test
+  (the inverse of v0.1's), late results surfaced by a later get, **poll abandonment never cancels** (outer
+  cancellation of a long-poll, and repeated timed-out polls), explicit cancel, cancel racing terminal,
+  cancel-call failure leaves the job running, job-budget exhaustion with upstream cancel and the prescriptive
+  message, late upstream completion not resurrected, terminal failures through the taxonomy, retriable vs
+  non-retriable poll errors, poll-call timeouts, re-readable results, TTL eviction ⇒ `unknown_job`,
+  `job_limit` listing jobs, the local-task path (success, error, budget under grace discipline, the
+  cancellation-swallowing task's log line, cancel, abandoned get), the sync tool untouched alongside jobs,
+  stdout hygiene over every job path, and the log grammar (`jid=` on every job line, `upstream_id` never in a
+  result). Adapter tests use SimpleNamespace fakes with create/retrieve/cancel (OpenAI) and
+  create/get/cancel (Gemini): `background`/`store` sent as specified, the droppable-param retry reused on
+  submit, terminal payloads mapped through the sync code, transport errors raised with the sync mapping (real
+  SDK exception classes), and the refactored sync `generate` pinned unchanged.
 
 Run: `pip install -e .[dev]` then `pytest`.
 
@@ -575,11 +756,16 @@ Run: `pip install -e .[dev]` then `pytest`.
    configured logger (`propagate=False`).
 2. **Errors are results, not exceptions.** Tool handlers always return the `success:false` envelope; the
    taxonomy values (§6.3) are stable API and may only be *added to*, not renamed.
-3. **The whole call clears the client cap.** Any new work inside a tool call must fit under
-   `request_budget_seconds` + `CANCEL_GRACE_SECONDS` < 240 s. New provider adapters must accept and honour the
-   `timeout` constructor arg; the outer `_run_bounded` is the backstop, not the primary mechanism.
-4. **Deadline results are dead.** Never surface work that completed after the budget; never trust a coroutine
-   that swallows cancellation (for its result *or* its exit).
+3. **Every tool call clears the client cap** *(rewritten in 0.2.0)*. Each tool call fits its own budget +
+   `CANCEL_GRACE_SECONDS` under `CLIENT_HARD_CAP_SECONDS`, per the §10.2 table. No tool call's worst case may
+   sit within 30 s of the cap except the legacy sync path, which is grandfathered and documented as such. New
+   provider adapters must accept and honour the `timeout` constructor arg (and the `timeout` argument of the
+   background control calls); the outer `_run_bounded` is the backstop, not the primary mechanism.
+4. **Call deadlines are dead; job lifetimes are alive** *(rewritten in 0.2.0)*. Work completing after a tool
+   call's own deadline is never surfaced **by that call**. Work completing within `job_budget_seconds` is
+   surfaced by any later `get`, by design — that is the point of a job. Work completing after the job budget
+   is dead at the job level (the job is already `failed(timeout)`; a late upstream completion is not
+   resurrected). Never trust a coroutine that swallows cancellation (for its result *or* its exit).
 5. **`max_output_tokens` is never silently dropped**; only advisory sampling knobs (`temperature`, `top_p`)
    are, at most once, on an explicit upstream rejection, charged against the remaining deadline.
 6. **Final answer only.** Extraction must return the trailing run of visible output — never a concatenation
@@ -593,6 +779,15 @@ Run: `pip install -e .[dev]` then `pytest`.
    keep working.
 10. **Explicit caller values win** over defaults even when falsy (`max_tokens=0` is honoured — `is not None`,
     not truthiness).
+11. **Poll abandonment never cancels** *(0.2.0)*. Only `cancel_second_opinion`, job-budget exhaustion, or
+    process shutdown (local tasks only) terminate upstream work. No `get` call, timed-out or otherwise, may
+    propagate cancellation to a job.
+12. **Job ids are server-scoped** *(0.2.0)*. Provider ids never appear as the client-facing job key, and never
+    appear in a tool result at all.
+13. **Terminal results are immutable and idempotently re-readable** *(0.2.0)* until TTL eviction.
+
+Invariants 1, 2, 5–10 apply to the job code paths unchanged (notably: stdout hygiene, errors-as-results,
+getattr-reflection adapters, explicit-caller-values-win).
 
 ## 16. Extension points
 
@@ -618,6 +813,10 @@ Run: `pip install -e .[dev]` then `pytest`.
 Each v1 boundary in §1 is an acknowledged, intentional gap — USAGE.md explicitly invites extending the server
 when one matters. Constraints to respect per candidate:
 
+- **Background jobs (submit/poll)** — **landed in 0.2.0** (§6.4, §10.2, DESIGN-submit-poll.md). Remaining
+  follow-ups from that design: durable job persistence (a JSON sidecar, not SQLite — v0.3 candidate; today a
+  restart orphans jobs, §6.4 of the design), MCP Tasks extension adoption once a host negotiates it, and the
+  grok `provider_stored` upgrade gated on the design's §12.1 experiment.
 - **Streaming** — would change the "full reply at once" contract and interact with §10 (partial results at
   deadline are currently defined as dead).
 - **Multi-model fan-out in one call** — today "compare two models" is two tool calls composed by Claude;

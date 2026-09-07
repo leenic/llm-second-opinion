@@ -145,6 +145,62 @@ class TestRequestBudget:
         assert cfg.timeout_seconds == cfg.request_budget_seconds
 
 
+class TestJobBudget:
+    """`job_budget_seconds` bounds a background job, not a tool call, so it
+    lives outside the 240s client cap entirely."""
+
+    def test_default_is_well_above_the_per_call_budget(self):
+        from llm_second_opinion.config import DEFAULT_JOB_BUDGET_SECONDS
+
+        assert DEFAULT_JOB_BUDGET_SECONDS == 900.0
+        assert DEFAULT_JOB_BUDGET_SECONDS > CLIENT_HARD_CAP_SECONDS
+
+    def test_absent_key_uses_the_default(self, config_env):
+        from llm_second_opinion.config import DEFAULT_JOB_BUDGET_SECONDS
+
+        config_env({"providers": {}})
+        cfg = load_config()
+        assert cfg.job_budget_seconds == DEFAULT_JOB_BUDGET_SECONDS
+        assert cfg.warnings == []
+
+    def test_explicit_value_is_used(self, config_env):
+        config_env({"providers": {}, "job_budget_seconds": 600})
+        assert load_config().job_budget_seconds == 600.0
+
+    def test_env_override(self, config_env, monkeypatch):
+        config_env({"providers": {}, "job_budget_seconds": 600})
+        monkeypatch.setenv(f"{config_mod.ENV_PREFIX}JOB_BUDGET", "1200")
+        assert load_config().job_budget_seconds == 1200.0
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_non_positive_is_rejected(self, config_env, value):
+        config_env({"providers": {}, "job_budget_seconds": value})
+        with pytest.raises(ConfigError, match="job_budget_seconds"):
+            load_config()
+
+    def test_unparseable_is_rejected(self, config_env):
+        config_env({"providers": {}, "job_budget_seconds": "later"})
+        with pytest.raises(ConfigError, match="job_budget_seconds"):
+            load_config()
+
+    def test_very_long_budget_is_warned_about_not_clamped(self, config_env):
+        config_env({"providers": {}, "job_budget_seconds": 7200})
+        cfg = load_config()
+        assert cfg.job_budget_seconds == 7200.0
+        assert any("job_budget_seconds" in w for w in cfg.warnings)
+
+    def test_threshold_itself_is_not_warned_about(self, config_env):
+        config_env({"providers": {}, "job_budget_seconds": 3600})
+        assert load_config().warnings == []
+
+    def test_request_budget_is_independent(self, config_env):
+        """The per-call budget still governs only the synchronous tool."""
+        config_env({"providers": {}, "request_budget_seconds": 90, "job_budget_seconds": 600})
+        cfg = load_config()
+        assert cfg.request_budget_seconds == 90.0
+        assert cfg.job_budget_seconds == 600.0
+
+
 class TestDefaultMaxTokens:
     def test_absent_key_uses_the_default(self, config_env):
         config_env({"providers": {}})
