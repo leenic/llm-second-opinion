@@ -249,7 +249,8 @@
     <h1>Give Claude a <span class="grad">second opinion</span>.</h1>
     <p class="lead">
       A local <b>Model Context Protocol</b> server that lets Claude step out of its own head — forwarding a
-      summary to <b>ChatGPT</b>, <b>Gemini</b>, or <b>Grok</b> and bringing back an independent, critical reply.
+      summary, or a document straight from disk, to <b>ChatGPT</b>, <b>Gemini</b>, or <b>Grok</b> and bringing back an
+      independent, critical reply.
       It closes the gap on information that exists in the world but isn't available to Claude, and surfaces
       genuinely <b>different perspectives for consideration</b>.
     </p>
@@ -315,8 +316,8 @@
       than any training cutoff. You stay in the driver's seat — after Claude's first take, you ask for one external
       opinion at a time (“get a second opinion from Gemini”, “have ChatGPT suggest what's missing”, “get Grok to
       cross-check”). Each request fires a single MCP call, and Claude folds the reply into a revised recommendation.
-      The last act shows the other mode: a review too heavy for one call is <b>submitted as a background job</b>,
-      polled, and collected minutes later.
+      The last act shows the other mode: a whole document is handed to the server <b>by path</b> rather than
+      pasted, the review is <b>submitted as a background job</b>, polled, and collected minutes later.
     </p>
 
     <div class="demo-shell" id="demoShell">
@@ -346,9 +347,9 @@
     <p class="sub">The server speaks MCP over stdio. Claude calls a tool; the server forwards your summary to one external model in a single, stateless turn and returns the reply as structured JSON. For reviews that need minutes rather than seconds, <code style="font-family:var(--mono);color:var(--accent-2)">submit_second_opinion</code> starts the same review as a background job and <code style="font-family:var(--mono);color:var(--accent-2)">get_second_opinion</code> collects it — every tool call stays short.</p>
     <div class="card" style="padding:8px;">
       <div class="flow">
-        <div class="step"><div class="n">1</div><h4>You ask Claude</h4><p>“Get a second opinion from Gemini on this plan.” Claude writes a self-contained summary of the context.</p></div>
-        <div class="step"><div class="n">2</div><h4>Claude calls the tool</h4><p><code style="font-family:var(--mono);color:var(--accent-2)">second_opinion</code> with a <code style="font-family:var(--mono);color:var(--accent-2)">target_model</code> and optional focus, system prompt, temperature, max&nbsp;tokens.</p></div>
-        <div class="step"><div class="n">3</div><h4>Server forwards it</h4><p>Single-turn call to that vendor's API — with the configured reasoning effort and web search. No chat history leaves your machine.</p></div>
+        <div class="step"><div class="n">1</div><h4>You ask Claude</h4><p>“Get a second opinion from Gemini on this plan.” Claude writes a self-contained summary of the context — or, for a document, names the file on disk.</p></div>
+        <div class="step"><div class="n">2</div><h4>Claude calls the tool</h4><p><code style="font-family:var(--mono);color:var(--accent-2)">second_opinion</code> with a <code style="font-family:var(--mono);color:var(--accent-2)">target_model</code> and optional focus, system prompt, temperature, max&nbsp;tokens, and <code style="font-family:var(--mono);color:var(--accent-2)">attachment_paths</code>.</p></div>
+        <div class="step"><div class="n">3</div><h4>Server forwards it</h4><p>Single-turn call to that vendor's API — with the configured reasoning effort and web search. Only the summary and any explicitly attached files leave your machine; no chat history, nothing else from disk.</p></div>
         <div class="step"><div class="n">4</div><h4>Reply comes back</h4><p>Structured JSON: the model's text, the real model id, token usage, and latency — or a clean, typed error.</p></div>
       </div>
     </div>
@@ -391,6 +392,7 @@
           <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>web_search</b>Attach the provider's built-in search tool — the key to fresh facts.</span></div>
           <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>model override</b>Point any target at a different model name, no code change.</span></div>
           <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>request_budget_seconds · job_budget_seconds</b>Wall-clock bounds: 200 s for a synchronous call (retries off, so it's exact), 15 min for a background job.</span></div>
+          <div class="row"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg><span><b>attachment_roots · max_attachment_bytes</b>The directories files may be attached from, and the total size cap (1 MB). Attachments are <b>off until you set the roots</b>; everything outside them is unreachable.</span></div>
         </div>
       </div>
     </div>
@@ -399,7 +401,7 @@
       <div class="card">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/><path d="M3 3l2 2M21 3l-2 2"/></svg></div>
         <h3>Background jobs for long reviews</h3>
-        <p>A whole document, web search on, high reasoning effort — <code style="font-family:var(--mono);color:var(--accent-2)">submit_second_opinion</code> returns a job id in seconds and the review runs upstream for up to 15 minutes (OpenAI and Google background execution; an in-process task for Grok). <code style="font-family:var(--mono);color:var(--accent-2)">get_second_opinion</code> polls it, results stay readable for 30 minutes, and only an explicit cancel stops it. Retries are safe: a <code style="font-family:var(--mono)">request_key</code> makes a repeated submit return the same job.</p>
+        <p>A whole document, web search on, high reasoning effort — <code style="font-family:var(--mono);color:var(--accent-2)">submit_second_opinion</code> returns a job id in seconds and the review runs upstream for up to 15 minutes (OpenAI and Google background execution; an in-process task for Grok). <code style="font-family:var(--mono);color:var(--accent-2)">get_second_opinion</code> polls it, results stay readable for 30 minutes, and only an explicit cancel stops it. Retries are safe: a <code style="font-family:var(--mono)">request_key</code> makes a repeated submit return the same job. For a whole document, attach it by path and let the server read it — no pasting.</p>
       </div>
       <div class="card">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></div>
@@ -409,7 +411,7 @@
       <div class="card">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></div>
         <h3>Graceful, typed errors</h3>
-        <p>Failures never crash the call — you get <code style="font-family:var(--mono);color:var(--accent-2)">success:false</code> with a type like <code style="font-family:var(--mono)">auth_failed</code>, <code style="font-family:var(--mono)">rate_limit</code>, <code style="font-family:var(--mono)">timeout</code>, <code style="font-family:var(--mono)">content_blocked</code>, or <code style="font-family:var(--mono)">unknown_job</code>.</p>
+        <p>Failures never crash the call — you get <code style="font-family:var(--mono);color:var(--accent-2)">success:false</code> with a type like <code style="font-family:var(--mono)">auth_failed</code>, <code style="font-family:var(--mono)">rate_limit</code>, <code style="font-family:var(--mono)">timeout</code>, <code style="font-family:var(--mono)">content_blocked</code>, <code style="font-family:var(--mono)">invalid_input</code> (every refused attachment), or <code style="font-family:var(--mono)">unknown_job</code>.</p>
       </div>
       <div class="card">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
@@ -446,7 +448,9 @@ py -3 -m venv .venv
 pip install -e .</pre>
         <h4 style="margin-top:18px;">2 · Configure</h4>
 <pre>copy config.example.json config.json
-notepad config.json   <span class="c"># add the keys you have</span></pre>
+notepad config.json   <span class="c"># add the keys you have;</span>
+                      <span class="c"># set attachment_roots to allow</span>
+                      <span class="c"># document reviews by path</span></pre>
       </div>
       <div>
         <h4>3 · Register with Claude</h4>
@@ -482,14 +486,16 @@ notepad config.json   <span class="c"># add the keys you have</span></pre>
   <div class="wrap">
     <span class="eyebrow">Honest scope</span>
     <h2>What it deliberately doesn't do</h2>
-    <p class="sub">This is a focused v1 for single-developer use. The boundaries are intentional.</p>
+    <p class="sub">This is a focused tool for single-developer use. The boundaries are intentional.</p>
     <div class="limits">
       <div>Single-turn only — no conversation history is forwarded to the external model.</div>
       <div>No response streaming — the full reply arrives at once.</div>
       <div>Background jobs live in memory — a server restart orphans them (ChatGPT/Gemini jobs still finish and bill upstream).</div>
       <div>No caching, cost tracking, or spend enforcement — only time budgets; watch your provider dashboards.</div>
       <div>No server-side rate limiting — it relies on the upstream provider's limits.</div>
-      <div>Stdio transport only — no HTTP or remote-access mode in v1.</div>
+      <div>Stdio transport only — no HTTP or remote-access mode.</div>
+      <div>Attachments are UTF-8 text only — no PDF, image or binary files.</div>
+      <div>Attachments come only from allow-listed directories — nothing else on disk is reachable, and their content never enters the log.</div>
       <div>Reachability is a key/outage probe — it doesn't validate the exact model name.</div>
     </div>
   </div>
@@ -541,16 +547,19 @@ notepad config.json   <span class="c"># add the keys you have</span></pre>
     { t: 'claude', text: "Grok cross-checks clean — same picks, sharper framing. <b>Final take:</b> choose by ecosystem (<b>Apple Reminders</b> / <b>Drafts</b> on Apple; <b>Todoist</b> / <b>TickTick</b> / <b>Google Keep</b> cross-platform; <b>Microsoft To Do</b> on Windows), then invest in the <b>capture trigger</b> — hotkey, Siri, or one widget — and confirm sync is rock-solid. That ordering matters more than the specific app." },
 
     // Act 2: a review too heavy for one tool call runs as a background job —
-    // submit returns a job id in seconds, get polls it, the result arrives
-    // minutes later without any single call approaching the client's cap.
-    { t: 'user', text: "Good. Now the heavy one: send our whole <b>40-page requirements doc</b> to ChatGPT for a full review — research pass, red team, three role critiques, web search on. Run it in the background; that won't fit in one call." },
-    { t: 'tool', label: 'submit_second_opinion · target=chatgpt · request_key=req-7f3a', done: 'job_id=9f8e7d6c5b4a · 0.8 s' },
-    { t: 'claude', text: "Submitted — ChatGPT is reviewing it as background job <b>9f8e7d6c5b4a</b>. I'll check in 45 seconds; ask me any time if you want an update." },
+    // the document goes to the server by path (attachment_paths) instead of
+    // being pasted into the summary, submit returns a job id in seconds, get
+    // polls it, and the result arrives minutes later without any single call
+    // approaching the client's cap.
+    { t: 'user', text: "Good. Now the heavy one: send our whole <b>40-page requirements doc</b> (<code>docs/requirements.md</code>) to ChatGPT for a full review — research pass, red team, three role critiques, web search on. Run it in the background; that won't fit in one call." },
+    { t: 'claude', text: "That's 190 KB — far more than I should paste into a tool call, and a copy could drift from the original. I'll hand the server the <b>file path</b> instead; it reads the document itself, byte-exact, and I'll send a short brief of what to review." },
+    { t: 'tool', label: 'submit_second_opinion · target=chatgpt · attachment_paths=[docs/requirements.md] · request_key=req-7f3a', done: 'job_id=9f8e7d6c5b4a · attachments: requirements.md 190,412 B · 0.8 s' },
+    { t: 'claude', text: "Submitted — ChatGPT is reviewing the full document as background job <b>9f8e7d6c5b4a</b>; the server confirms it read <b>requirements.md</b> (190,412 bytes). I'll check in 45 seconds; ask me any time if you want an update." },
     { t: 'tool', label: 'get_second_opinion · wait_seconds=45', done: 'running · retry_after 15 s', wait: 1500 },
     { t: 'claude', text: "Still running after 45 s — a full-document review with search takes a few minutes. I'll poll again shortly rather than tie up the session." },
     { t: 'tool', label: 'get_second_opinion · wait_seconds=45', done: 'succeeded · job 6 m 28 s', wait: 1500 },
-    { t: 'opinion', cls: 'gpt', name: 'ChatGPT · gpt-5.6-sol', tag: 'background · 6m 28s', html: "<b>Research pass:</b> two cited standards were superseded this spring. <b>Red team:</b> the offline-sync section assumes clocks agree; it doesn't survive a device restored from backup. <b>Role critiques</b> (ops, security, support) attached in full — 14k tokens, well past what a single 200 s call could carry." },
-    { t: 'claude', text: "The full review is back — six and a half minutes of upstream work, delivered through two short polls. Headline: update the two superseded references, and the <b>offline-sync clock assumption</b> is a real design gap worth fixing before the next draft. Want me to walk through the three role critiques?" }
+    { t: 'opinion', cls: 'gpt', name: 'ChatGPT · gpt-5.6-sol', tag: 'background · 6m 28s', html: "<b>Research pass:</b> two cited standards were superseded this spring. <b>Red team:</b> the offline-sync section assumes clocks agree; it doesn't survive a device restored from backup. <b>Role critiques</b> (ops, security, support) included in full, quoting §4.2 and §7.1 of the source — 14k tokens, well past what a single 200 s call could carry." },
+    { t: 'claude', text: "The full review is back — six and a half minutes of upstream work on the byte-exact document, delivered through two short polls. Headline: update the two superseded references, and the <b>offline-sync clock assumption</b> is a real design gap worth fixing before the next draft. Want me to walk through the three role critiques?" }
   ];
 
   var timers = [];
