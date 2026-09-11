@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from ..attachments import Attachment, render_attachment
 
 
 # Error type taxonomy surfaced back to Claude. Keep values stable — Claude may
@@ -32,6 +34,10 @@ class SecondOpinionRequest:
     system_prompt: str
     temperature: float | None
     max_tokens: int | None
+    # Files the server read on the caller's behalf (DESIGN §17), spliced into
+    # the user message after `summary`, in order. Already guarded and
+    # decoded — see attachments.py.
+    attachments: list[Attachment] = field(default_factory=list)
 
 
 @dataclass
@@ -153,7 +159,18 @@ class Provider(ABC):
         """Configured default model identifier for this provider."""
 
     def build_user_content(self, req: SecondOpinionRequest) -> str:
-        """Compose the user message: focus (if any) followed by the summary."""
-        if req.focus:
-            return f"Focus on: {req.focus}\n\n{req.summary}"
-        return req.summary
+        """Compose the user message — see the module-level `build_user_content`."""
+        return build_user_content(req)
+
+
+def build_user_content(req: SecondOpinionRequest) -> str:
+    """The user message (SPEC §7, DESIGN §17.3): an optional `Focus on:`
+    prefix, then `summary`, then one delimited block per attachment in
+    order. Module-level so the server can measure the assembled prompt's
+    length for the `log_prompts` line without a provider instance."""
+    parts: list[str] = []
+    if req.focus:
+        parts.append(f"Focus on: {req.focus}")
+    parts.append(req.summary)
+    parts.extend(render_attachment(a) for a in req.attachments)
+    return "\n\n".join(parts)

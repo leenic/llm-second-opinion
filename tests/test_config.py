@@ -240,7 +240,9 @@ class TestDefaultMaxTokens:
 
 class TestValidation:
     def test_bad_reasoning_effort_is_rejected(self, config_env):
-        config_env({"providers": {"openai": {"api_key": "x", "reasoning_effort": "max"}}})
+        # `max` was the old example, but OpenAI documents it as valid now
+        # (DESIGN §18.3) — use a value no vendor documents.
+        config_env({"providers": {"openai": {"api_key": "x", "reasoning_effort": "ultra"}}})
         with pytest.raises(ConfigError, match="reasoning_effort"):
             load_config()
 
@@ -270,3 +272,63 @@ class TestValidation:
         config_env({"providers": {"gemini": {"api_key": "x", "web_search": not expected}}})
         monkeypatch.setenv(f"{config_mod.ENV_PREFIX}GEMINI_WEB_SEARCH", value)
         assert load_config().providers["gemini"].web_search is expected
+
+
+class TestPerProviderReasoningEfforts:
+    """DESIGN §18.3: a global enum rejected valid values and passed invalid
+    ones; the allowed set is per provider, sourced from vendor docs."""
+
+    def test_every_provider_has_a_non_empty_set(self):
+        from llm_second_opinion.config import REASONING_EFFORTS_BY_PROVIDER
+
+        assert set(REASONING_EFFORTS_BY_PROVIDER) == set(DEFAULT_MODELS)
+        for name, efforts in REASONING_EFFORTS_BY_PROVIDER.items():
+            assert efforts, name
+            assert all(isinstance(e, str) and e == e.lower() for e in efforts), name
+
+    @pytest.mark.parametrize("provider", sorted(DEFAULT_MODELS))
+    def test_each_documented_value_is_accepted(self, config_env, provider):
+        from llm_second_opinion.config import REASONING_EFFORTS_BY_PROVIDER
+
+        for value in sorted(REASONING_EFFORTS_BY_PROVIDER[provider]):
+            config_env({"providers": {provider: {"api_key": "x", "reasoning_effort": value}}})
+            assert load_config().providers[provider].reasoning_effort == value
+
+    @pytest.mark.parametrize("provider", sorted(DEFAULT_MODELS))
+    @pytest.mark.parametrize("other", sorted(DEFAULT_MODELS))
+    def test_a_value_from_another_providers_set_is_rejected(self, config_env, provider, other):
+        from llm_second_opinion.config import REASONING_EFFORTS_BY_PROVIDER
+
+        if other == provider:
+            pytest.skip("same provider")
+        mine = REASONING_EFFORTS_BY_PROVIDER[provider]
+        foreign = sorted(REASONING_EFFORTS_BY_PROVIDER[other] - mine)
+        if not foreign:
+            # OpenAI documents a superset of the other vendors' vocabularies,
+            # so nothing of theirs is foreign to it (checked 2026-09-11).
+            pytest.skip(f"{other}'s values are all valid for {provider}")
+        config_env({"providers": {provider: {"api_key": "x", "reasoning_effort": foreign[0]}}})
+        with pytest.raises(ConfigError) as exc:
+            load_config()
+        message = str(exc.value)
+        assert provider in message and foreign[0] in message
+        for allowed in mine:
+            assert allowed in message, "the error must list the provider's allowed values"
+
+    def test_the_sets_are_not_all_identical(self):
+        """The whole point of §18.3: one global enum could not be right."""
+        from llm_second_opinion.config import REASONING_EFFORTS_BY_PROVIDER
+
+        assert len({frozenset(v) for v in REASONING_EFFORTS_BY_PROVIDER.values()}) > 1
+
+    @pytest.mark.parametrize("provider", sorted(DEFAULT_MODELS))
+    def test_an_undocumented_value_is_rejected_naming_the_provider(self, config_env, provider):
+        config_env({"providers": {provider: {"api_key": "x", "reasoning_effort": "ultra"}}})
+        with pytest.raises(ConfigError, match=provider):
+            load_config()
+
+    def test_env_override_is_validated_per_provider(self, config_env, monkeypatch):
+        config_env({"providers": {"gemini": {"api_key": "x"}}})
+        monkeypatch.setenv(f"{config_mod.ENV_PREFIX}GEMINI_REASONING_EFFORT", "xhigh")
+        with pytest.raises(ConfigError, match="gemini"):
+            load_config()

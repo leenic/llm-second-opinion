@@ -69,16 +69,45 @@ DEFAULT_JOB_BUDGET_SECONDS = 900.0
 # stored ones follow the account's retention policy). Honoured, never clamped.
 JOB_BUDGET_WARN_THRESHOLD_SECONDS = 3600.0
 
-REASONING_EFFORTS = {"minimal", "low", "medium", "high"}
+# Attachments (DESIGN-submit-poll.md §17.4). Disabled until at least one root
+# is configured: the server never reads the filesystem at a model's direction
+# unless the operator has named where. The cap is the total across all
+# attachments on one call (~250K tokens: under every configured model's
+# context with room for search ingestion and output).
+DEFAULT_MAX_ATTACHMENT_BYTES = 1_000_000
+
+# Per-provider allowed `reasoning_effort` values (DESIGN-submit-poll.md §18.3).
+# A global enum both rejected valid values and passed invalid ones, because
+# the vocabularies differ by vendor and shift by model generation. Each set
+# below is the vendor's documented value set for its current model line,
+# checked against primary documentation on 2026-09-11; narrowing per model is
+# left to the vendor (a value a specific model rejects surfaces as
+# `bad_request` with the vendor's message).
+REASONING_EFFORTS_BY_PROVIDER: dict[str, frozenset[str]] = {
+    # https://developers.openai.com/api/docs/guides/reasoning (checked
+    # 2026-09-11): "Supported values are model-dependent and can include
+    # none, minimal, low, medium, high, xhigh, and max."
+    "openai": frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"}),
+    # https://ai.google.dev/gemini-api/docs/thinking (checked 2026-09-11):
+    # `thinking_level` per model — the 3.x Flash line (incl. the default
+    # gemini-3.6-flash) takes minimal/low/medium/high; Pro lines take
+    # low/medium/high or low/high. The provider set is the union.
+    "gemini": frozenset({"minimal", "low", "medium", "high"}),
+    # https://docs.x.ai/docs/guides/reasoning (checked 2026-09-11):
+    # `reasoning_effort` accepts low, medium, high, xhigh; xhigh is available
+    # on grok-4.6 and later and is treated as high on grok-4.5.
+    "grok": frozenset({"low", "medium", "high", "xhigh"}),
+}
 
 
 @dataclass
 class ProviderConfig:
     api_key: str | None = None
     model: str = ""
-    # One of: "minimal", "low", "medium", "high", or None to leave at SDK default.
-    # For Gemini this maps to a thinking_budget; for OpenAI/Grok it's the
-    # reasoning effort field on the Responses API.
+    # One of the provider's REASONING_EFFORTS_BY_PROVIDER values, or None to
+    # leave the SDK default. For Gemini this is `thinking_level` on the
+    # Interactions API; for OpenAI/Grok it is `reasoning.effort` on the
+    # Responses API.
     reasoning_effort: str | None = None
     # If true, attach the provider's built-in web search tool to every call.
     web_search: bool = False
@@ -95,6 +124,11 @@ class AppConfig:
     # only the submit/poll tools; `request_budget_seconds` still governs the
     # synchronous tool alone.
     job_budget_seconds: float = DEFAULT_JOB_BUDGET_SECONDS
+    # Directories whose files may be passed as `attachment_paths`. Empty (the
+    # default) disables attachments entirely — see attachments.py.
+    attachment_roots: list[str] = field(default_factory=list)
+    # Total byte cap across all attachments on one call.
+    max_attachment_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES
     log_prompts: bool = False
     log_level: str = "INFO"
     config_path: Path | None = None
@@ -174,10 +208,11 @@ def load_config() -> AppConfig:
         reasoning_effort: str | None = None
         if raw_effort is not None and str(raw_effort).strip():
             normalised = str(raw_effort).strip().lower()
-            if normalised not in REASONING_EFFORTS:
+            allowed = REASONING_EFFORTS_BY_PROVIDER[name]
+            if normalised not in allowed:
                 raise ConfigError(
                     f"providers.{name}.reasoning_effort must be one of "
-                    f"{sorted(REASONING_EFFORTS)} (got {raw_effort!r})"
+                    f"{sorted(allowed)} for provider {name!r} (got {raw_effort!r})"
                 )
             reasoning_effort = normalised
 
@@ -201,6 +236,8 @@ def load_config() -> AppConfig:
     request_budget_seconds = _load_request_budget(raw, warnings)
     job_budget_seconds = _load_job_budget(raw, warnings)
     default_max_tokens = _load_default_max_tokens(raw)
+    attachment_roots = _load_attachment_roots(raw, warnings)
+    max_attachment_bytes = _load_max_attachment_bytes(raw)
 
     log_prompts = bool(raw.get("log_prompts", False))
     if f"{ENV_PREFIX}LOG_PROMPTS" in os.environ:
@@ -213,6 +250,8 @@ def load_config() -> AppConfig:
         request_budget_seconds=request_budget_seconds,
         job_budget_seconds=job_budget_seconds,
         default_max_tokens=default_max_tokens,
+        attachment_roots=attachment_roots,
+        max_attachment_bytes=max_attachment_bytes,
         log_prompts=log_prompts,
         log_level=log_level,
         config_path=path,
@@ -319,3 +358,50 @@ def _load_default_max_tokens(raw: dict) -> int | None:
     if tokens <= 0:
         raise ConfigError("default_max_tokens must be > 0, or null to disable")
     return tokens
+
+
+def _load_attachment_roots(raw: dict, warnings: list[str]) -> list[str]:
+    """Directories whose files may be attached (DESIGN §17.4).
+
+    Env `LLM_SECOND_OPINION_ATTACHMENT_ROOTS` (an `os.pathsep`-separated list)
+    beats the file's `attachment_roots` list. Empty means disabled. Roots are
+    kept as given — resolution (symlinks followed) happens per call — but a
+    root that is not an existing directory is warned about at startup, since
+    it can never admit a file.
+    """
+    env_value = os.environ.get(f"{ENV_PREFIX}ATTACHMENT_ROOTS")
+    if env_value is not None:
+        roots = [p.strip() for p in env_value.split(os.pathsep) if p.strip()]
+    else:
+        value = raw.get("attachment_roots")
+        if value is None:
+            roots = []
+        elif isinstance(value, list) and all(isinstance(v, str) for v in value):
+            roots = [v.strip() for v in value if v.strip()]
+        else:
+            raise ConfigError("`attachment_roots` must be a list of directory paths")
+    for root in roots:
+        if not Path(root).expanduser().is_dir():
+            warnings.append(
+                f"attachment_roots entry {root!r} is not an existing directory; "
+                f"no attachment can resolve inside it"
+            )
+    return roots
+
+
+def _load_max_attachment_bytes(raw: dict) -> int:
+    """Total byte cap across all attachments on one call (DESIGN §17.4)."""
+    env_value = os.environ.get(f"{ENV_PREFIX}MAX_ATTACHMENT_BYTES")
+    if env_value is not None and env_value.strip():
+        value: object = env_value
+    elif "max_attachment_bytes" in raw:
+        value = raw["max_attachment_bytes"]
+    else:
+        return DEFAULT_MAX_ATTACHMENT_BYTES
+    try:
+        cap = int(value)
+    except (TypeError, ValueError) as e:
+        raise ConfigError(f"Invalid max_attachment_bytes: {value!r}") from e
+    if cap <= 0:
+        raise ConfigError("max_attachment_bytes must be > 0")
+    return cap
