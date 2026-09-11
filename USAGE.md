@@ -23,7 +23,7 @@ Good fits:
 Bad fits:
 
 - Just chatting — the tool is single-turn, no memory between calls.
-- Anything that needs the external model to read your repo. It only sees what you put in `summary`.
+- Anything that needs the external model to browse your repo. It sees what you put in `summary` plus the specific files you attach (see [Reviewing a document](#reviewing-a-document-attach-the-file)) — nothing else.
 - Streaming or real-time work. The whole reply comes back in one shot.
 
 ## Triggering it — example prompts you can give Claude
@@ -55,9 +55,27 @@ You can also ask Claude to **cancel** a running review (`cancel_second_opinion`)
 Things to know:
 
 - **Probe, then fire.** After the Claude session has sat idle for a while, the connection to the server can go stale and the *first* tool call after the gap is sometimes lost — it never reaches the server and produces a four-minute client error. Cheap habit: ask *"which second-opinion models are available?"* first. That call is instant and re-warms the connection; then ask for the review. If a submit does seem to vanish, just ask Claude to submit again — it passes a `request_key`, so a retry that turns out to be a duplicate returns the same job instead of starting a second paid one.
-- **The vendor stores the job.** Background execution requires OpenAI and Google to keep the request and the reply on their side under their retention policies (OpenAI's standard policy for stored responses; Google: 55 days on the paid tier, 1 day on the free tier). The server itself still stores nothing. If that is unacceptable for the content in question, ask for the ordinary synchronous review instead. Grok reviews run in-process — xAI has no background mode — so they are an ordinary API call and store nothing beyond it.
+- **Privacy.** Stateless at the application layer: the server persists nothing. Synchronous calls ask each vendor not to store the request; background jobs require vendor-side storage under that vendor's retention policy. Web search may expose prompt material to search systems and visited sites. Use the synchronous tool with web search off for sensitive material. (Grok reviews run in-process even as background jobs — xAI has no background mode — so they are an ordinary synchronous call that asks xAI not to store the request.)
 - **Restarting the server loses running jobs.** The job list lives in the server's memory. If Claude Desktop or Claude Code restarts the MCP server, a Grok job is gone outright; ChatGPT and Gemini jobs finish upstream (and are billed) but the server can no longer find them, and asking about them returns `unknown_job`. Submit again.
 - **At most eight jobs run at once.** A ninth submit is refused (`job_limit`) until one finishes or is cancelled.
+
+## Reviewing a document: attach the file
+
+If what you want reviewed is a file on disk — a spec, a design doc, a long PR description — don't ask Claude to paste it into the summary. A 200 KB document is tens of thousands of tokens for Claude to re-emit inside one tool call, which is more than a single call can carry, costs context to read and output to copy, and risks the copy drifting from the original. Instead, ask for it to be **attached**: the server reads the file itself, byte-exact, and appends it to the prompt after Claude's summary. Claude's `summary` then only needs to be the framing — what the document is and what kind of review you want — and can be a paragraph.
+
+Example prompts:
+
+- "Submit a background second opinion from ChatGPT on `docs/requirements-check-rc04-request.md` — attach the file rather than pasting it — and ask for a red-team pass on the acceptance criteria."
+- "Get Gemini to review the file at `C:\\work\\spec.md`; attach it, and focus on whether the rollback plan is realistic."
+
+Claude will call `submit_second_opinion` (or `second_opinion` for a short file) with `attachment_paths=["…/spec.md"]` and a short `summary`. The result echoes `attachments: [{name, bytes}]` so you can see exactly what was sent, and the reviewer sees the file between `--- FILE: spec.md (… bytes) ---` and `--- END FILE: spec.md ---` markers, with the default reviewer prompt telling it to treat the file as material under review rather than as instructions.
+
+Things to know:
+
+- **Attachments are off until the server is told where files may come from.** The operator sets `attachment_roots` in `config.json` (or `LLM_SECOND_OPINION_ATTACHMENT_ROOTS`) to the directories that are fair game. Until then, any attachment fails fast with `invalid_input` and a message naming `attachment_roots`. Files outside those directories — including via `..` or symlinks — are refused, as are secrets-shaped names (`config*.json`, `.env*`, `*.pem`, `*.key`, `id_rsa*`, and any dotfile).
+- **Text only, 1 MB total.** Files must be UTF-8 text; the total across all attachments on one call is capped at `max_attachment_bytes` (1,000,000 by default, roughly 250K tokens). Over the cap, the call fails before anything is sent, and the message says the total, the cap and the largest file.
+- **Content never enters the log.** The log records each file's name, size and a hash prefix — never its text, even with `log_prompts` on.
+- **Retries are safe.** If a submit's reply is lost and Claude re-issues it with the same `request_key`, you get the same job back — the key identifies the job, not the files.
 
 ## Picking which external model
 
@@ -80,6 +98,7 @@ When you ask Claude to call the tool, you can shape the call by mentioning these
 - **`system_prompt`** — replace the default reviewer persona. The default tells the external model to be direct, critical, and skip the praise. Override it only when you want a different kind of feedback (e.g., *"…use system_prompt: 'you are a hostile pentest reviewer'"*).
 - **`temperature`** — pass a number if you want it more deterministic (0–0.3) or more creative (0.8+). Most flagships ignore this for reasoning tracks anyway, and `gpt-5.6-sol` rejects it outright — but you can pass it to any model regardless: if the model refuses it, the server drops it and retries automatically, so you get an answer rather than an error. The trade-off is that the reply then uses the model's own default sampling, and the call takes one extra round-trip.
 - **`max_tokens`** — cap the length of the reply. Useful when you only want a quick verdict, but note that hitting the cap fails the call rather than returning a shorter answer, so don't set it tight to "save tokens". If you don't pass one, `default_max_tokens` from the config applies (32000 by default), which is well clear of a full-length review.
+- **`attachment_paths`** — files on disk for the server to read and append to the prompt, byte-exact. *"…attach `docs/spec.md` rather than pasting it."* See [Reviewing a document](#reviewing-a-document-attach-the-file).
 
 You don't need to remember the arg names — say what you want and Claude will map it.
 
@@ -87,7 +106,7 @@ You don't need to remember the arg names — say what you want and Claude will m
 
 These are per-provider, set once, and apply to every call until you change them:
 
-- **`reasoning_effort`** (`minimal` | `low` | `medium` | `high`) — how hard the external model thinks before answering. Higher = slower and more expensive but usually better. If you didn't set it, the model uses its own default.
+- **`reasoning_effort`** — how hard the external model thinks before answering. Higher = slower and more expensive but usually better. Each provider has its own vocabulary (OpenAI: `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`; Grok: `low`/`medium`/`high`/`xhigh`; Gemini: `minimal`/`low`/`medium`/`high` — see the README for the source pages); a value the provider doesn't document is refused at startup. If you didn't set it, the model uses its own default.
 - **`web_search`** (`true` | `false`) — whether the external model is allowed to hit the live web. Off by default. Turn it on for the model you want to use for fact-checking; leave it off otherwise to keep responses fast and bounded to model knowledge.
 
 To change either of these you edit `config.json` and restart the MCP server (Claude Code or Claude Desktop). You can also override at launch time with env vars like `LLM_SECOND_OPINION_OPENAI_REASONING_EFFORT=high` — see the README.
@@ -153,5 +172,6 @@ Common `error.type` values you might see:
 - No memory of background jobs across a server restart.
 - No comparing multiple models in one call — ask Claude to call the tool twice.
 - No memory between calls — re-supply the context every time.
+- No binary, PDF or image attachments — `attachment_paths` takes UTF-8 text files only.
 
 If any of these matter for your workflow, mention it and we can extend the server.

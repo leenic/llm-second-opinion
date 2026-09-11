@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llm-second-opinion"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local MCP server that routes a user-supplied summary to an external LLM (Gemini, Grok, ChatGPT) for an independent second opinion."
 readme = "README.md"
 requires-python = ">=3.10"

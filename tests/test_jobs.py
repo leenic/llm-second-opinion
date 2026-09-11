@@ -1441,7 +1441,9 @@ class TestOpenAIBackground:
         resp = await provider.generate(request_factory(temperature=0.2))
         assert resp.text == ANSWER
         assert len(calls) == 2
-        assert "background" not in calls[0] and "store" not in calls[0]
+        # The sync path asks the vendor not to store (DESIGN §18.1); it never
+        # sends `background`.
+        assert "background" not in calls[0] and calls[0]["store"] is False
         assert 0 < calls.timeouts[0] <= 30.0
 
 
@@ -1520,8 +1522,10 @@ class TestGeminiBackground:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "status,error_type",
+        # DESIGN §18.2: `content_blocked` only on a block signal; the rest
+        # are upstream_error with retriability per status.
         [("failed", "upstream_error"), ("budget_exceeded", "upstream_error"),
-         ("cancelled", "content_blocked"), ("incomplete", "content_blocked")],
+         ("cancelled", "upstream_error"), ("incomplete", "upstream_error")],
     )
     async def test_poll_terminal_failures_keep_the_sync_mappings(self, status, error_type):
         provider, _ = gemini_provider(get=interaction(status))
@@ -1583,7 +1587,8 @@ class TestGeminiBackground:
     async def test_poll_cancelled_from_outside_is_the_sync_mapping(self):
         provider, _ = gemini_provider(get=interaction("cancelled"))
         poll = await provider.poll_background("int_1", timeout=30.0)
-        assert poll.done and poll.error.error_type == "content_blocked"
+        assert poll.done and poll.error.error_type == "upstream_error"
+        assert poll.error.retriable is False and "cancelled" in poll.error.message
 
     @pytest.mark.asyncio
     async def test_sync_generate_is_unchanged_by_the_refactor(self, request_factory):

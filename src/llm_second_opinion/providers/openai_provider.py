@@ -98,6 +98,11 @@ class ResponsesAPIProvider(Provider):
         kwargs: dict[str, Any] = {
             "model": self.model,
             "input": self.build_user_content(req),
+            # The synchronous path asks the vendor not to retain the request
+            # (DESIGN §18.1; both OpenAI and xAI store by default). Background
+            # submission overrides this to True — OpenAI background mode needs
+            # a stored response to poll beyond its short unstored window.
+            "store": False,
         }
         if req.system_prompt:
             kwargs["instructions"] = req.system_prompt
