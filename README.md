@@ -68,7 +68,7 @@ A provider with no key (or with the `REPLACE-ME` placeholder) is treated as unav
 | `default_max_tokens` | Reply cap applied when the caller passes no `max_tokens` (default 32000). Set to `null` to leave replies unbounded. See [Choosing the reply cap](#choosing-the-reply-cap) — a cap that is too tight fails the call outright rather than returning a shorter answer |
 | `attachment_roots` | List of directories whose files may be passed as `attachment_paths`. **Empty by default, which disables attachments**: any call with `attachment_paths` then fails with `invalid_input` naming this key. See [Attachments](#attachments) |
 | `max_attachment_bytes` | Total byte cap across all attachments on one call (default 1000000). Exceeding it fails the call before any upstream request |
-| `log_prompts` | If `true`, prompts and responses are written to the log. Off by default |
+| `log_prompts` | If `true`, prompts and responses are written to the log. Off by default. Attachment content is never logged regardless, and for calls carrying attachments the reply text is withheld too |
 
 #### Bounding call duration
 
@@ -308,7 +308,7 @@ This is the first place the server reads the filesystem at a model's direction, 
 | UTF-8 text only | A file that does not decode as strict UTF-8 is refused naming the file. Binary, PDF and image attachments are not supported in 0.2.1 |
 | Size cap | `max_attachment_bytes` (default 1,000,000, roughly 250K tokens) across all files on one call, checked from `stat()` before anything is read or sent; the message states the total, the cap and the largest file |
 
-Every refusal is `invalid_input` and costs nothing upstream. Every use logs `attachments=<count> attachment_bytes=<total>` on the request line and one `attach=<basename> bytes=<n> sha256=<12 hex>` line per file; content is never logged, even with `log_prompts` on (that DEBUG line carries the assembled prompt's length and the digests). The default reviewer prompt tells the model that attached files are quoted material under review, not instructions. A `request_key` still identifies the job, not its content: re-using a key with different attachments returns the existing job.
+Every refusal is `invalid_input` and costs nothing upstream. The read is bound to the file that was validated (the open handle must be the same regular file the checks saw, so a path swapped for a link in between is refused), and loading runs off the event loop under the call's budget — a stalled disk returns a `timeout` rather than freezing the server, and the provider call gets only the budget left. Every use logs `attachments=<count> attachment_bytes=<total>` on the request line and one `attach=<basename> bytes=<n> sha256=<12 hex>` line per file; content is never logged, even with `log_prompts` on (that DEBUG line carries the assembled prompt's length and the digests, and for attachment-bearing calls the reply text is withheld from the log too, since a reviewer may quote the file). The default reviewer prompt tells the model that attached files are quoted material under review, not instructions. A `request_key` still identifies the job, not its content: re-using a key with different attachments returns the existing job.
 
 ### `submit_second_opinion`
 

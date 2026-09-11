@@ -582,3 +582,163 @@ class TestListAvailableModelsReportsAttachments:
             "max_attachment_bytes": 123,
         }
         assert "Attached files are quoted material" in result["default_system_prompt"]
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups (Codex review of the 0.2.1 branch)
+# ---------------------------------------------------------------------------
+
+
+class TestReadIsBoundToTheValidatedFile:
+    """The read must be of the same regular file pass 1 validated: a path or
+    parent swapped for a link between stat() and open() is refused."""
+
+    def test_identity_mismatch_is_refused(self, root, monkeypatch):
+        path = write(root / "doc.md", "hello\n")
+        real_fstat = att.os.fstat
+
+        def swapped_fstat(fd):
+            st = real_fstat(fd)
+            return type(st)(tuple(st)[:1] + (st.st_ino + 1,) + tuple(st)[2:])
+
+        monkeypatch.setattr(att.os, "fstat", swapped_fstat)
+        with pytest.raises(AttachmentError, match="changed between validation and read"):
+            load_attachments([str(path)], [str(root)], 1000)
+
+    def test_non_regular_handle_is_refused(self, root, monkeypatch):
+        import stat as stat_mod
+
+        path = write(root / "doc.md", "hello\n")
+        real_fstat = att.os.fstat
+
+        def dir_fstat(fd):
+            st = real_fstat(fd)
+            mode = (st.st_mode & ~stat_mod.S_IFMT(st.st_mode)) | stat_mod.S_IFDIR
+            return type(st)(tuple(st)[:0] + (mode,) + tuple(st)[1:])
+
+        monkeypatch.setattr(att.os, "fstat", dir_fstat)
+        with pytest.raises(AttachmentError, match="changed between validation and read"):
+            load_attachments([str(path)], [str(root)], 1000)
+
+    def test_unchanged_file_reads_normally(self, root):
+        path = write(root / "doc.md", "hello\n")
+        [a] = load_attachments([str(path)], [str(root)], 1000)
+        assert a.content == "hello\n"
+
+
+class TestLoadingIsBoundedAndOffTheLoop:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", TOOLS)
+    async def test_slow_loader_returns_a_structured_timeout(self, run, root, tool, monkeypatch):
+        import time as time_mod
+
+        import llm_second_opinion.server as server_mod
+        from llm_second_opinion import jobs as jobs_mod
+
+        def slow(*a, **k):
+            time_mod.sleep(0.3)
+            return []
+
+        monkeypatch.setattr(server_mod, "load_attachments", slow)
+        monkeypatch.setattr(server_mod, "CANCEL_GRACE_SECONDS", 0.05)
+        monkeypatch.setattr(jobs_mod, "SUBMIT_BUDGET_SECONDS", 0.05)
+        config = make_config([str(root)])
+        config.request_budget_seconds = 0.05
+        runner, provider = run(config)
+        path = write(root / "doc.md", "x")
+        started = time_mod.monotonic()
+        result = await runner(tool, attachment_paths=[str(path)])
+        assert time_mod.monotonic() - started < 0.3, "must not wait for the loader"
+        assert result["success"] is False
+        assert result["error"]["type"] == "timeout"
+        assert result["error"]["retriable"] is True
+        assert provider.requests == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", TOOLS)
+    async def test_loader_does_not_block_the_event_loop(self, run, root, tool, monkeypatch):
+        import asyncio
+        import time as time_mod
+
+        import llm_second_opinion.server as server_mod
+        from llm_second_opinion.attachments import load_attachments as real_load
+
+        def slow(*a, **k):
+            time_mod.sleep(0.2)
+            return real_load(*a, **k)
+
+        monkeypatch.setattr(server_mod, "load_attachments", slow)
+        runner, _ = run(make_config([str(root)]))
+        path = write(root / "doc.md", "x")
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        t = asyncio.ensure_future(ticker())
+        try:
+            result = await runner(tool, attachment_paths=[str(path)])
+        finally:
+            t.cancel()
+        assert result["success"] is True
+        assert ticks >= 5, f"loop was blocked during the load (ticks={ticks})"
+
+    @pytest.mark.asyncio
+    async def test_sync_provider_is_charged_only_the_remaining_budget(self, run, root, monkeypatch):
+        import time as time_mod
+
+        import llm_second_opinion.server as server_mod
+        from llm_second_opinion.attachments import load_attachments as real_load
+
+        def slow(*a, **k):
+            time_mod.sleep(0.1)
+            return real_load(*a, **k)
+
+        monkeypatch.setattr(server_mod, "load_attachments", slow)
+        monkeypatch.setattr(server_mod, "CANCEL_GRACE_SECONDS", 0.05)
+        config = make_config([str(root)])
+        config.request_budget_seconds = 0.15
+        runner, provider = run(config, provider=StubProvider(delay=0.1))
+        path = write(root / "doc.md", "x")
+        started = time_mod.monotonic()
+        result = await runner("second_opinion", attachment_paths=[str(path)])
+        assert result["error"]["type"] == "timeout", result
+        assert time_mod.monotonic() - started < 0.15 + 0.05 + 0.1, "load + provider exceeded the budget"
+        assert provider.cancelled == 1
+
+
+class TestResponseTextIsWithheldForAttachmentReviews:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", TOOLS)
+    async def test_reviewer_quoting_the_attachment_does_not_reach_the_log(
+        self, run, root, tool, caplog
+    ):
+        from llm_second_opinion.providers.base import SecondOpinionResponse, TokenUsage
+
+        path = write(root / "doc.md", SECRET_CONTENT)
+        quoting = StubProvider(result=SecondOpinionResponse(
+            provider="stub", model="stub-model",
+            text=f"The document says: {SECRET_CONTENT.strip()}", usage=TokenUsage(1, 2, 3, 0),
+            latency_ms=1,
+        ))
+        log = logging.getLogger(f"test_attachments.quote.{tool}")
+        runner, _ = run(make_config([str(root)], log_prompts=True), provider=quoting, logger=log)
+        with caplog.at_level(logging.DEBUG, logger=log.name):
+            result = await runner(tool, attachment_paths=[str(path)])
+        assert result["success"] is True
+        assert "MUST-NEVER-BE-LOGGED" in result["response"], "the reply itself is untouched"
+        messages = "\n".join(r.getMessage() for r in caplog.records)
+        assert "MUST-NEVER-BE-LOGGED" not in messages
+        if tool == "second_opinion":
+            assert "response_text=withheld" in messages
+
+    @pytest.mark.asyncio
+    async def test_reply_is_still_logged_without_attachments(self, run, caplog):
+        log = logging.getLogger("test_attachments.noattach")
+        runner, _ = run(make_config(log_prompts=True), logger=log)
+        with caplog.at_level(logging.DEBUG, logger=log.name):
+            await runner("second_opinion")
+        assert any("response_text='stub answer'" in r.getMessage() for r in caplog.records)

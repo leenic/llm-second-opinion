@@ -189,10 +189,13 @@ def build_server(
             )
 
         # Attachments are guarded and read before any provider work, so a
-        # refused path costs nothing upstream (design §17.4).
-        attachments, failure = _load_attachments_or_error(
+        # refused path costs nothing upstream (design §17.4). The load is
+        # charged against this call's budget, and the provider bound below
+        # gets only what is left, so the whole call still clears the cap.
+        budget = config.request_budget_seconds
+        attachments, failure = await _load_attachments_or_error(
             attachment_paths, config, request_id=request_id, tool="second_opinion",
-            target_model=target_model, log=log, elapsed_ms=elapsed_ms(),
+            target_model=target_model, log=log, elapsed_ms=elapsed_ms, budget=budget,
         )
         if failure is not None:
             return failure
@@ -253,7 +256,10 @@ def build_server(
             # adapter that ignores the arg) would otherwise run past Desktop's
             # 240s cap, which cancels the call and discards the result.
             #
-            response = await _run_bounded(provider.generate(req), budget, log)
+            # Charged only the budget left after attachment loading, so the
+            # call as a whole — not each stage — is what the budget bounds.
+            remaining = max(0.0, budget - (time.monotonic() - started))
+            response = await _run_bounded(provider.generate(req), remaining, log)
         except (asyncio.TimeoutError, TimeoutError):
             took = elapsed_ms()
             log.warning(
@@ -300,7 +306,17 @@ def build_server(
             usage.get("output_tokens") if usage else None,
         )
         if config.log_prompts:
-            log.debug("rid=%s response_text=%r", request_id, response.text)
+            if attachments:
+                # A reviewer quoting the attachment would put its content in
+                # the log; attachment content never reaches a log line under
+                # any setting (§17.4), so the reply is withheld for these calls.
+                log.debug(
+                    "rid=%s response_chars=%d response_text=withheld "
+                    "reason=attachment_bearing_request",
+                    request_id, len(response.text),
+                )
+            else:
+                log.debug("rid=%s response_text=%r", request_id, response.text)
 
         return {
             "success": True,
@@ -415,11 +431,13 @@ def build_server(
                 return _submit_result(request_id, existing, config, reused=True)
 
         # After the request_key lookup (the key identifies the job, §17.6)
-        # and before any upstream work (§17.4).
-        attachments, failure = _load_attachments_or_error(
+        # and before any upstream work (§17.4). Bounded by the submit budget:
+        # a submit is a fast call, and 30 s + 30 s + grace still clears the
+        # client cap by the §7 margin.
+        attachments, failure = await _load_attachments_or_error(
             attachment_paths, config, request_id=request_id,
             tool="submit_second_opinion", target_model=target_model, log=log,
-            elapsed_ms=elapsed_ms(),
+            elapsed_ms=elapsed_ms, budget=submit_budget,
         )
         if failure is not None:
             return failure
@@ -1184,7 +1202,7 @@ def _unknown_job_message(job_id: Any, jobs: JobRegistry) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _load_attachments_or_error(
+async def _load_attachments_or_error(
     attachment_paths: list[str] | None,
     config: AppConfig,
     *,
@@ -1192,11 +1210,41 @@ def _load_attachments_or_error(
     tool: str,
     target_model: str,
     log: logging.Logger,
-    elapsed_ms: int,
+    elapsed_ms: Callable[[], int],
+    budget: float,
 ) -> tuple[list[Attachment], None] | tuple[None, dict[str, Any]]:
+    """Load attachments off the event loop, under the tool call's budget.
+
+    Filesystem reads are blocking and, on a slow or network-mounted root,
+    unbounded; run on the loop they would stall every job poller and sit
+    outside the call's deadline. So the loader runs in a worker thread under
+    `_run_bounded` with the same discipline as an upstream call: overrun
+    ⇒ a structured `timeout`, the thread's late result discarded. The
+    caller charges the provider bound only the budget left afterwards.
+    """
+    if not attachment_paths:
+        return [], None
     try:
-        attachments = load_attachments(
-            attachment_paths, config.attachment_roots, config.max_attachment_bytes
+        attachments = await _run_bounded(
+            asyncio.to_thread(
+                load_attachments,
+                attachment_paths, config.attachment_roots, config.max_attachment_bytes,
+            ),
+            budget, log,
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        took = elapsed_ms()
+        log.warning(
+            "rid=%s tool=%s target=%s outcome=timeout reason=attachment_load "
+            "elapsed_ms=%d budget_s=%.1f",
+            request_id, tool, target_model, took, budget,
+        )
+        return None, _error_response(
+            request_id, target_model, "timeout",
+            f"Reading the attachments did not finish within the {budget:g}s call "
+            f"budget (after {took / 1000:.1f}s). Attach fewer or smaller files, or "
+            f"files on a faster disk, and retry.",
+            retriable=True, elapsed_ms=took,
         )
     except AttachmentError as e:
         message = str(e)
@@ -1207,10 +1255,10 @@ def _load_attachments_or_error(
     log.warning(
         "rid=%s tool=%s target=%s outcome=error type=invalid_input reason=attachment "
         "elapsed_ms=%d",
-        request_id, tool, target_model, elapsed_ms,
+        request_id, tool, target_model, elapsed_ms(),
     )
     return None, _error_response(
-        request_id, target_model, "invalid_input", message, elapsed_ms=elapsed_ms,
+        request_id, target_model, "invalid_input", message, elapsed_ms=elapsed_ms(),
     )
 
 

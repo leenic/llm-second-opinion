@@ -17,6 +17,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 
@@ -158,6 +159,7 @@ def load_attachments(
 
     # Pass 1: guard and size, reading no content.
     staged: list[tuple[str, Path, str, int]] = []
+    identities: list[tuple[int, int]] = []
     for raw in paths:
         given = Path(raw).expanduser()
         try:
@@ -191,19 +193,30 @@ def load_attachments(
                 f"attached."
             )
         try:
-            size = resolved.stat().st_size
+            st = resolved.stat()
         except OSError as e:
             raise AttachmentError(f"attachment {raw!r} could not be read: {e}") from None
-        staged.append((raw, resolved, name, size))
+        staged.append((raw, resolved, name, st.st_size))
+        identities.append((st.st_dev, st.st_ino))
 
     _check_total(staged, max_total_bytes)
 
-    # Pass 2: read and decode.
+    # Pass 2: read and decode. The read is bound to the file validated in
+    # pass 1: the open handle's identity must match the stat()ed inode and be
+    # a regular file, so a path or parent swapped for a link between the two
+    # passes is refused rather than followed.
     loaded: list[Attachment] = []
     actual: list[tuple[str, Path, str, int]] = []
-    for raw, resolved, name, _size in staged:
+    for (raw, resolved, name, _size), identity in zip(staged, identities):
         try:
-            data = resolved.read_bytes()
+            with open(resolved, "rb") as fh:
+                fst = os.fstat(fh.fileno())
+                if not stat.S_ISREG(fst.st_mode) or (fst.st_dev, fst.st_ino) != identity:
+                    raise AttachmentError(
+                        f"attachment {raw!r} changed between validation and read "
+                        f"(not the same regular file); refusing it."
+                    )
+                data = fh.read()
         except OSError as e:
             raise AttachmentError(f"attachment {raw!r} could not be read: {e}") from None
         actual.append((raw, resolved, name, len(data)))

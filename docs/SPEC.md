@@ -190,7 +190,7 @@ Send a summary to one external LLM and return its independent, critical reply.
 | `system_prompt` | `str \| None` | no | Replaces the default reviewer prompt; blank/whitespace falls back to the default. |
 | `temperature` | `float \| None` | no | Passed through when set. If the model rejects it, it is dropped and retried once (§9.3). |
 | `max_tokens` | `int \| None` | no | Output cap. `None` ⇒ `default_max_tokens` applies. The check is `is not None`, so an explicit `0` is honoured, not replaced by the default. |
-| `attachment_paths` | `list[str] \| None` | no | (0.2.1) Local files the **server** reads and splices into the user message after `summary`, in order (§7). Guarded by `attachments.load_attachments` per design §17.4: roots allowlist (empty ⇒ disabled, `invalid_input` naming `attachment_roots`), strict containment after resolving symlinks (components compared, case-insensitive and drive-aware on Windows), basename denylist, regular files only, strict UTF-8, `max_attachment_bytes` total checked from `stat()` before any read. Every refusal is `invalid_input` (never `internal_error`) and precedes provider construction, so nothing is sent upstream. |
+| `attachment_paths` | `list[str] \| None` | no | (0.2.1) Local files the **server** reads and splices into the user message after `summary`, in order (§7). Guarded by `attachments.load_attachments` per design §17.4: roots allowlist (empty ⇒ disabled, `invalid_input` naming `attachment_roots`), strict containment after resolving symlinks (components compared, case-insensitive and drive-aware on Windows), basename denylist, regular files only, strict UTF-8, `max_attachment_bytes` total checked from `stat()` before any read; the read itself is bound to the validated file (`os.fstat` of the opened handle must be the same regular file, by `(st_dev, st_ino)`, that pass 1 stat()ed — a path or parent swapped for a link in between is refused). Every refusal is `invalid_input` (never `internal_error`) and precedes provider construction, so nothing is sent upstream. Loading runs in a worker thread under `_run_bounded` with the call's budget (`request_budget_seconds` here, `SUBMIT_BUDGET_SECONDS` on submit): overrun ⇒ a retriable `timeout`, and the sync provider bound is charged only the remaining budget, so the whole call clears the cap (invariant 3). |
 
 **Handler flow** (`server.build_server → second_opinion`):
 
@@ -733,8 +733,11 @@ gpt ~21 s (`medium`), grok ~44–50 s (`high`); a long open-ended prompt pushes 
 - **Attachments (0.2.1):** the request line carries `attachments=<count> attachment_bytes=<total>` and each
   file gets `rid=… [jid=…] attach=<basename> bytes=<n> sha256=<first 12 hex>`. Attachment **content is never
   logged under any setting** — the `log_prompts` DEBUG line logs `prompt_chars=<assembled length>` and the
-  name:digest list instead of the spliced text (test-enforced with `log_prompts=true`). A refused attachment
-  logs `outcome=error type=invalid_input reason=attachment`.
+  name:digest list instead of the spliced text, and the sync path's `response_text` DEBUG line is replaced by
+  `response_chars=<n> response_text=withheld` for attachment-bearing calls, since a reviewer may quote the file
+  (both test-enforced with `log_prompts=true`). A refused attachment logs
+  `outcome=error type=invalid_input reason=attachment`; a load that overruns the budget logs
+  `outcome=timeout reason=attachment_load`.
 
 ## 13. Security and privacy posture
 
