@@ -2,15 +2,16 @@
 
 **📖 [Introduction &amp; live demo →](https://leenic.github.io/llm-second-opinion/)** — what it is, why it exists, and an animated walkthrough.
 
-A local MCP server that exposes a `second_opinion` tool. When Claude calls it, the server forwards a user-supplied summary to an external LLM (Gemini, Grok, or ChatGPT) and returns that model's independent, critical reply. Designed for single-developer use over stdio.
+A local MCP server that lets Claude ask an external LLM (Gemini, Grok, or ChatGPT) for an independent, critical second opinion. The review runs either as one synchronous tool call or as a background job that outlives any single call, and the material under review can be a summary Claude writes or a file on disk the server reads directly. Designed for single-developer use over stdio.
 
 ## What it does
 
-- `second_opinion` — sends a `summary` to one of `gemini`, `grok`, or `chatgpt`, returns the external model's reply along with the actual model identifier, token usage (when reported), and upstream latency. Synchronous: the reply comes back in the same tool call.
+- `second_opinion` — sends a `summary` to one of `gemini`, `grok`, or `chatgpt`, returns the external model's reply along with the actual model identifier, token usage (when reported), and upstream latency. Synchronous: the reply comes back in the same tool call, bounded at 200 s.
 - `submit_second_opinion` / `get_second_opinion` / `cancel_second_opinion` — the same review run as a **background job**. `submit` returns a `job_id` within seconds; `get` polls it (optionally waiting up to 45 s); `cancel` stops it. Use these for heavyweight reviews — large documents, web search, high reasoning effort — that cannot finish inside the per-call time cap. See [Background jobs](#background-jobs-submitpoll).
-- `list_available_models` — returns which providers have an API key configured and pass a basic reachability check, so Claude can tell you up front which targets are usable.
+- **Attachments** (0.2.1) — both review tools take `attachment_paths`: files the server reads itself and splices into the prompt after `summary`, byte-exact, so a document review does not round-trip the document through Claude's context and output. Off until `attachment_roots` is configured; guarded by a root allowlist, a secrets denylist, text-only and size checks. See [Attachments](#attachments).
+- `list_available_models` — returns which providers have an API key configured and pass a basic reachability check, each provider's allowed `reasoning_effort` values, and whether attachments are enabled, so Claude can tell you up front what is usable.
 
-Each call is single-turn. No conversation history is forwarded to the external model.
+Each call is single-turn. Only the summary, focus, system prompt and any explicitly attached files go to the external model — no conversation history, nothing else from disk. See [Privacy](#privacy).
 
 ### Provider interfaces (as of 25 July 2026)
 
@@ -134,7 +135,9 @@ Every tool call stays short, so a call the client drops costs only the price of 
 
 **Restart semantics.** The job registry is process memory only. If the server restarts, `get_second_opinion` returns `unknown_job` for every earlier job: grok jobs died with the process; ChatGPT and Gemini jobs finish upstream, are billed, and are in principle retrievable from the vendor — but the `job_id` → response-id mapping is gone, so this server cannot reach them. Durable mapping is a deliberate non-goal for 0.2.
 
-**Privacy.** Stateless at the application layer: the server persists nothing. Synchronous calls ask each vendor not to store the request; background jobs require vendor-side storage under that vendor's retention policy. Web search may expose prompt material to search systems and visited sites. Use the synchronous tool with web search off for sensitive material. In detail: the synchronous tool sends `store: false` to OpenAI and xAI (Responses API) and to Google (Interactions API); background jobs send `store: true` to OpenAI (unstored background responses are kept only about ten minutes) and nothing about storage to Google, whose interactions are stored by default (55 days on the paid tier, 1 day on the free tier) and which rejects `store: false` with background execution. Grok-backed jobs are an ordinary synchronous API call with `store: false`.
+#### Privacy
+
+Stateless at the application layer: the server persists nothing. Synchronous calls ask each vendor not to store the request; background jobs require vendor-side storage under that vendor's retention policy. Web search may expose prompt material to search systems and visited sites. Use the synchronous tool with web search off for sensitive material. In detail: the synchronous tool sends `store: false` to OpenAI and xAI (Responses API) and to Google (Interactions API); background jobs send `store: true` to OpenAI (unstored background responses are kept only about ten minutes) and nothing about storage to Google, whose interactions are stored by default (55 days on the paid tier, 1 day on the free tier) and which rejects `store: false` with background execution. Grok-backed jobs are an ordinary synchronous API call with `store: false`. Attachments are read only from directories you allowlist and their content never enters the log (see [Attachments](#attachments)).
 
 **Cancellation is explicit.** Abandoning, timing out, or never issuing a `get` call never cancels a job. Only `cancel_second_opinion`, job-budget exhaustion, or (for grok) process shutdown stops upstream work.
 
@@ -284,7 +287,7 @@ Error response (non-crashing — the tool returns `success: false`):
 }
 ```
 
-Error `type` is one of: `missing_api_key`, `auth_failed`, `rate_limit`, `timeout`, `network_error`, `upstream_error`, `bad_request`, `content_blocked`, `invalid_input`, `internal_error`, and for the job tools `unknown_job`, `job_limit`.
+Error `type` is one of: `missing_api_key`, `auth_failed`, `rate_limit`, `timeout`, `network_error`, `upstream_error`, `bad_request`, `content_blocked`, `invalid_input`, `internal_error`, and for the job tools `unknown_job`, `job_limit`. `content_blocked` is produced only on an explicit safety/refusal signal from the vendor (0.2.1: a Gemini interaction that ends `incomplete` is a token-cap outcome and surfaces as a retriable `upstream_error` naming `max_tokens`, matching the Responses family). `invalid_input` covers an empty `summary` and every refused attachment; `retriable` on any error says whether re-issuing the call may help.
 
 ### Attachments
 

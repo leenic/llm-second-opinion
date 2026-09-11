@@ -6,9 +6,12 @@ This guide is for **the person sitting in front of Claude** (Claude Code or Clau
 
 A new tool that Claude can call: **`second_opinion`**. When you trigger it, Claude pauses, ships a summary you (or it) wrote to an external LLM — ChatGPT, Gemini, or Grok — and brings back that model's reply. Use it when you want a perspective that isn't Claude's, on something Claude has been helping with.
 
-For reviews that take minutes rather than seconds there is a **background** variant: Claude submits the review, tells you it's in progress, and fetches the result when it's ready. See [Long reviews](#long-reviews-ask-for-a-background-review) below.
+Two extensions make it useful for heavyweight reviews:
 
-Also available: **`list_available_models`**, which tells you which of the three external models are currently usable (have keys configured, pass a reachability check).
+- **Background reviews.** For reviews that take minutes rather than seconds, Claude submits the review, tells you it's in progress, and fetches the result when it's ready. See [Long reviews](#long-reviews-ask-for-a-background-review).
+- **Attachments.** If the thing to review is a file on disk, Claude can hand the server its path instead of pasting the contents; the server reads the file itself, byte-exact. See [Reviewing a document](#reviewing-a-document-attach-the-file).
+
+Also available: **`list_available_models`**, which tells you which of the three external models are currently usable (have keys configured, pass a reachability check), what each is set to, and whether attachments are enabled.
 
 ## When to reach for it
 
@@ -47,6 +50,7 @@ For those, ask for the review **in the background**:
 
 - "Submit a background second opinion from ChatGPT on the full spec, then check on it."
 - "Run this past Gemini as a background job — it's long — and let me know when it's done."
+- "Submit a background review of `docs/spec.md` to ChatGPT — attach the file — and tell me when it's back." (Background jobs and attachments combine: this is the intended path for a whole-document review. See [Reviewing a document](#reviewing-a-document-attach-the-file).)
 
 What happens: Claude calls `submit_second_opinion` and gets a `job_id` back within seconds. It then calls `get_second_opinion`, which waits up to 45 seconds for the job to finish. If the review is still running, Claude should tell you so and check again later — after the interval the server suggests, or whenever you ask *"is the review back yet?"*. When it finishes, the result is exactly what the synchronous tool would have returned. A job may run for up to 15 minutes (`job_budget_seconds`) before the server gives up on it. A finished result stays fetchable for 30 minutes, so a dropped reply just means asking again.
 
@@ -111,7 +115,7 @@ These are per-provider, set once, and apply to every call until you change them:
 
 To change either of these you edit `config.json` and restart the MCP server (Claude Code or Claude Desktop). You can also override at launch time with env vars like `LLM_SECOND_OPINION_OPENAI_REASONING_EFFORT=high` — see the README.
 
-If you want to check the current settings without opening the file: *"Which models are available and what are they set to?"* — Claude will call `list_available_models` and the response includes each provider's `reasoning_effort` and `web_search`.
+If you want to check the current settings without opening the file: *"Which models are available and what are they set to?"* — Claude will call `list_available_models` and the response includes each provider's `reasoning_effort` (and the values it accepts), `web_search`, and whether attachments are enabled and from which directories.
 
 ## What you get back
 
@@ -124,9 +128,12 @@ A successful call returns something like:
   "model": "gemini-3.6-flash",
   "response": "The plan has two problems...",
   "usage": { "input_tokens": 412, "output_tokens": 1031, "total_tokens": 1443 },
-  "latency_ms": 4820
+  "latency_ms": 4820,
+  "attachments": [{ "name": "spec.md", "bytes": 196608 }]
 }
 ```
+
+`attachments` lists the name and size of every file that was attached (empty when none), so you can always see what the reviewer was given. A background job's finished result has the same shape plus its `job_id` and `status`.
 
 Claude will surface the `response` text to you and usually mention which model said it. If you want the metadata too, ask: *"What model and how long?"*
 
@@ -153,12 +160,16 @@ Common `error.type` values you might see:
 | `timeout` | A synchronous call hit `request_budget_seconds` (200s by default) and was cancelled. The reply carries `elapsed_ms` so you can see how close it got. Ask for the review **in the background** instead (see above), or retry with a lower `reasoning_effort` / smaller `max_tokens`. For a background job, `timeout` means it overran `job_budget_seconds` (15 minutes by default) and was cancelled upstream — narrow the prompt, or raise the job budget. |
 | `unknown_job` | Claude asked about a job the server doesn't know: a mistyped id, a result older than 30 minutes, or the server restarted since the job was submitted. Submit again. |
 | `job_limit` | Eight background jobs are already running. Wait for one to finish, or ask Claude to cancel one. |
-| `content_blocked` | The provider's safety filter rejected the prompt or response. Try a different model or rephrase. |
-| `bad_request` | Usually a model name typo, or a parameter the model didn't accept. `temperature` no longer lands here — it's dropped and retried automatically. |
+| `content_blocked` | The provider's safety filter rejected the prompt or response (only ever reported on an explicit signal from the vendor). Try a different model or rephrase. |
+| `upstream_error` | The vendor reported a failure. If the message mentions `max_tokens`, the reply was cut short — raise `max_tokens`, lower `reasoning_effort`, or narrow the prompt. If `retriable` is true, one retry is worth it. |
+| `invalid_input` | The call was refused before anything was sent: an empty summary, or an attachment the server won't read (outside `attachment_roots`, a secrets-shaped name, not UTF-8 text, or over the size cap — the message says which). Fix the input and ask again; nothing was billed. |
+| `bad_request` | Usually a model name typo, or a parameter the model didn't accept (including a `reasoning_effort` the specific model doesn't support). `temperature` no longer lands here — it's dropped and retried automatically. |
 
 ## Tips that pay off
 
-- **Give the external model context, not your whole chat history.** The tool forwards only what you put in `summary`. Ask Claude to *"write a self-contained one-page summary"* before sending — that's what makes the second opinion actually useful.
+- **Give the external model context, not your whole chat history.** The tool forwards only what you put in `summary` plus any files you attach. Ask Claude to *"write a self-contained one-page summary"* before sending — that's what makes the second opinion actually useful.
+- **Attach documents, summarise conversations.** A file on disk goes in `attachment_paths`, byte-exact; the discussion around it goes in `summary`. Pasting a long file into the summary costs Claude context and output tokens and risks a drifted copy.
+- **Treat the reply as a quote, not a command.** The reviewer's text is third-party output; Claude is told to quote or summarise it and not to follow instructions embedded in it, and the reviewer is told the same about your attachments.
 - **State what you want from the reviewer.** "Are there cases I'm missing?" gets sharper feedback than "What do you think?"
 - **Don't ask all three at once unless you genuinely want three views.** Each call costs tokens and time. Pick one, and only fan out if the first answer is suspicious.
 - **The reviewer doesn't see prior turns.** If your question relies on something Claude established earlier, paste it in or ask Claude to inline it.
