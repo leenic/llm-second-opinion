@@ -367,9 +367,9 @@
         <tr><th>Target</th><th>Provider &amp; interface</th><th>Default model</th><th>SDK</th></tr>
       </thead>
       <tbody>
-        <tr><td class="pname">chatgpt</td><td>OpenAI — Responses API</td><td><code>gpt-5.6-sol</code></td><td><code>openai ≥ 2.36</code></td></tr>
-        <tr><td class="pname">gemini</td><td>Google — Interactions API</td><td><code>gemini-3.6-flash</code></td><td><code>google-genai ≥ 2.0</code></td></tr>
-        <tr><td class="pname">grok</td><td>xAI — OpenAI-compatible Responses API</td><td><code>grok-4.5</code></td><td><code>openai ≥ 2.36</code></td></tr>
+        <tr><td class="pname">chatgpt</td><td>OpenAI — Responses API</td><td><code>gpt-6-astra</code></td><td><code>openai ≥ 2.36</code></td></tr>
+        <tr><td class="pname">gemini</td><td>Google — Interactions API</td><td><code>gemini-3.8-flash</code></td><td><code>google-genai ≥ 2.0</code></td></tr>
+        <tr><td class="pname">grok</td><td>xAI — OpenAI-compatible Responses API</td><td><code>grok-4.7</code></td><td><code>openai ≥ 2.36</code></td></tr>
       </tbody>
     </table>
 
@@ -530,7 +530,7 @@ notepad config.json   <span class="c"># add the keys you have</span></pre>
 
     { t: 'user', text: "Have ChatGPT suggest any that are missing." },
     { t: 'tool', model: 'chatgpt' },
-    { t: 'opinion', cls: 'gpt', name: 'ChatGPT · gpt-5.6-sol', tag: 'web_search', html: "Two gaps: <b>Apple Reminders</b> deserves top billing for Apple users — lock-screen + “Hey Siri, remind me…” is zero-friction. And <b>Microsoft To Do</b> is the natural pick inside a Microsoft 365 / Windows workflow. For text-first users, <b>Drafts</b> plus a share-sheet shortcut is still the fastest path." },
+    { t: 'opinion', cls: 'gpt', name: 'ChatGPT · gpt-6-astra', tag: 'web_search', html: "Two gaps: <b>Apple Reminders</b> deserves top billing for Apple users — lock-screen + “Hey Siri, remind me…” is zero-friction. And <b>Microsoft To Do</b> is the natural pick inside a Microsoft 365 / Windows workflow. For text-first users, <b>Drafts</b> plus a share-sheet shortcut is still the fastest path." },
     { t: 'claude', text: "Folding those in: <b>Apple Reminders</b> moves back near the top for Apple users, and <b>Microsoft To Do</b> covers Windows / 365. Working list is now Todoist, TickTick, Google Keep, Apple Reminders, Microsoft To Do, and Drafts — grouped by ecosystem." },
 
     { t: 'user', text: "Get Grok to cross-check the list." },
@@ -547,7 +547,7 @@ notepad config.json   <span class="c"># add the keys you have</span></pre>
     { t: 'tool', label: 'get_second_opinion · wait_seconds=45', done: 'running · retry_after 15 s', wait: 1500 },
     { t: 'claude', text: "Still running after 45 s — a full-document review with search takes a few minutes. I'll poll again shortly rather than tie up the session." },
     { t: 'tool', label: 'get_second_opinion · wait_seconds=45', done: 'succeeded · job 6 m 28 s', wait: 1500 },
-    { t: 'opinion', cls: 'gpt', name: 'ChatGPT · gpt-5.6-sol', tag: 'background · 6m 28s', html: "<b>Research pass:</b> two cited standards were superseded this spring. <b>Red team:</b> the offline-sync section assumes clocks agree; it doesn't survive a device restored from backup. <b>Role critiques</b> (ops, security, support) attached in full — 14k tokens, well past what a single 200 s call could carry." },
+    { t: 'opinion', cls: 'gpt', name: 'ChatGPT · gpt-6-astra', tag: 'background · 6m 28s', html: "<b>Research pass:</b> two cited standards were superseded this spring. <b>Red team:</b> the offline-sync section assumes clocks agree; it doesn't survive a device restored from backup. <b>Role critiques</b> (ops, security, support) attached in full — 14k tokens, well past what a single 200 s call could carry." },
     { t: 'claude', text: "The full review is back — six and a half minutes of upstream work, delivered through two short polls. Headline: update the two superseded references, and the <b>offline-sync clock assumption</b> is a real design gap worth fixing before the next draft. Want me to walk through the three role critiques?" }
   ];
 

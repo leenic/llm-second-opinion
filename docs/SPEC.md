@@ -121,7 +121,7 @@ Per provider (`openai`, `gemini`, `grok` — the keys of `DEFAULT_MODELS`; every
 | Field | Resolution (highest precedence first) | Validation / semantics |
 |---|---|---|
 | `api_key` | env `LLM_SECOND_OPINION_<NAME>_API_KEY` → file `providers.<name>.api_key` | Blank or containing `REPLACE-ME` ⇒ `None` ⇒ provider **unavailable** (server still runs) |
-| `model` | env `…_<NAME>_MODEL` → file `model` → `DEFAULT_MODELS[name]` | Defaults: `openai: gpt-5.6-sol`, `gemini: gemini-3.6-flash`, `grok: grok-4.5` (each vendor's current flagship — the env override exists so a new flagship needs no code change) |
+| `model` | env `…_<NAME>_MODEL` → file `model` → `DEFAULT_MODELS[name]` | Defaults: `openai: gpt-6-astra`, `gemini: gemini-3.8-flash`, `grok: grok-4.7` (each vendor's current flagship — the env override exists so a new flagship needs no code change) |
 | `reasoning_effort` | env `…_<NAME>_REASONING_EFFORT` → file value | Normalised (strip + lowercase); must be one of `minimal, low, medium, high` else `ConfigError`; unset/empty ⇒ `None` ⇒ SDK default thinking depth (reasoning **on** for all three current flagships) |
 | `web_search` | env `…_<NAME>_WEB_SEARCH` (truthy: `1/true/yes/on`) → file boolean → `False` | Non-boolean file value is ignored (treated as `False`) |
 
@@ -203,7 +203,7 @@ Send a summary to one external LLM and return its independent, critical reply.
   "request_id": "ab12cd34ef56",
   "target_model": "gemini",
   "provider": "gemini",
-  "model": "gemini-3.6-flash",
+  "model": "gemini-3.8-flash",
   "response": "…the external model's final answer…",
   "usage": {"input_tokens": 123, "output_tokens": 456, "total_tokens": 579, "reasoning_tokens": 40},
   "latency_ms": 1840,
@@ -225,7 +225,7 @@ Send a summary to one external LLM and return its independent, critical reply.
   "success": false,
   "request_id": "ab12cd34ef56",
   "target_model": "grok",
-  "model": "grok-4.5",
+  "model": "grok-4.7",
   "error": {"type": "timeout", "message": "…", "retriable": true},
   "elapsed_ms": 200009
 }
@@ -255,7 +255,7 @@ can answer "what's set up?" without burning a real call.
     {
       "target_model": "chatgpt",
       "provider": "openai",
-      "configured_model": "gpt-5.6-sol",
+      "configured_model": "gpt-6-astra",
       "api_key_configured": true,
       "available": true,
       "reason": null,
@@ -507,7 +507,7 @@ message items is one answer). All access is via `getattr` — see §14 for why t
 
 ### 9.3 Droppable-parameter retry — **invariant boundaries**
 
-Reasoning-only models (live example: `gpt-5.6-sol`) reject advisory sampling knobs outright —
+Reasoning-only models (live examples: `gpt-5.6-sol`, `gpt-6-astra`) reject advisory sampling knobs outright —
 `400 Unsupported parameter: 'temperature' is not supported with this model.` — instead of ignoring them.
 Failing the whole call over an advisory knob wastes the user's round-trip, so:
 
@@ -559,7 +559,7 @@ model-output text, a non-text block after collecting is a barrier).
 
 **Model id:** `response.model` may be a string or an object; `id`/`name` attributes are tried before `str()`.
 
-No droppable-param retry exists on this path (`gemini-3.6-flash` accepts `temperature`).
+No droppable-param retry exists on this path (`gemini-3.6-flash` and `gemini-3.8-flash` accept `temperature`).
 
 **Structure (0.2.0):** `generate` = `_build_kwargs` → `_call(make_coro, timeout)` (the `wait_for` bound and
 the error mapping above; the coroutine is created inside the guard) → `_build_response` (the status mapping,
@@ -655,7 +655,7 @@ but never to the job — background work decoupled from any listener is the poin
 error (§9.1) — the user gets *nothing*, not a shorter answer — so a tight cap is strictly worse than a loose
 one (an earlier default of 8000 was cutting real reviews short; commit history records the raise).
 
-The real ceiling is the time budget, not the provider API. Measured live (long-form prompt):
+The real ceiling is the time budget, not the provider API. Measured live (long-form prompt) on the previous defaults; `gemini-3.8-flash` keeps the same 65,536 output cap:
 
 | Model | Hard output cap | Sustained rate | Reachable in 200 s |
 |---|---|---|---|

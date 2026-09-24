@@ -15,9 +15,9 @@ from pathlib import Path
 ENV_PREFIX = "LLM_SECOND_OPINION_"
 
 DEFAULT_MODELS = {
-    "openai": "gpt-5.6-sol",
-    "gemini": "gemini-3.6-flash",
-    "grok": "grok-4.5",
+    "openai": "gpt-6-astra",
+    "gemini": "gemini-3.8-flash",
+    "grok": "grok-4.7",
 }
 
 # One budget bounds the whole tool call: the outer `asyncio.wait_for` in the
@@ -45,7 +45,7 @@ BUDGET_WARN_THRESHOLD_SECONDS = 235.0
 # 8000 was cutting real reviews short.
 #
 # The real ceiling is the request budget, not the API. Measured against the
-# live providers: gemini-3.6-flash caps output at 65536 and sustains ~178
+# live providers: gemini-3.6-flash caps output at 65536 (3.8 too) and sustains ~178
 # tok/s (~35k inside a 200s budget); OpenAI and xAI publish no hard cap at all
 # (both accepted max_output_tokens=10_000_000) but generate at ~62 and ~49
 # tok/s, so the budget binds first at roughly 12k and 10k. At 60000 both of
