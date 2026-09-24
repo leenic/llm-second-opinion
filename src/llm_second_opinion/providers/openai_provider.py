@@ -41,7 +41,7 @@ _NON_TERMINAL_STATUSES = frozenset({"queued", "in_progress"})
 
 # Sampling knobs we can drop and still answer the user's actual question.
 # Reasoning-only models reject these outright rather than ignoring them:
-# gpt-5.6-sol returns `400 Unsupported parameter: 'temperature' is not
+# gpt-5.6-sol and gpt-6-astra return `400 Unsupported parameter: 'temperature' is not
 # supported with this model.` Deliberately excludes `max_output_tokens` — a
 # length cap bounds cost and truncation, so silently dropping it could return
 # a far longer and more expensive reply than the caller asked for. Better to
@@ -205,9 +205,19 @@ class ResponsesAPIProvider(Provider):
         self, upstream_id: str, timeout: float
     ) -> BackgroundPoll | None:
         client = self._client().with_options(timeout=timeout)
-        # Idempotent upstream: a response that already finished is returned
-        # as-is, so the caller can keep that result instead of losing it.
-        response = await self._mapped(client.responses.cancel(upstream_id), timeout)
+        try:
+            response = await self._mapped(client.responses.cancel(upstream_id), timeout)
+        except ProviderError as e:
+            # Cancelling a finished response is not idempotent live: OpenAI
+            # answers `400 Cannot cancel a completed response.` (measured
+            # 2026-09-24 on gpt-5.6-sol and gpt-6-astra) instead of returning
+            # it. That 400 is the job finishing between our last poll and the
+            # cancel, so fetch the result and keep it rather than lose it.
+            if e.error_type != "bad_request":
+                raise
+            response = await self._mapped(client.responses.retrieve(upstream_id), timeout)
+            if getattr(response, "status", None) in _NON_TERMINAL_STATUSES:
+                raise e
         poll = self._classify(response)
         if not poll.done:
             # The cancel was accepted but the status has not caught up yet;

@@ -1427,6 +1427,53 @@ class TestOpenAIBackground:
         assert outcome.done and outcome.response.text == ANSWER
 
     @pytest.mark.asyncio
+    async def test_cancel_rejected_as_completed_fetches_and_keeps_the_result(self):
+        """Live OpenAI rejects cancelling a finished response with a 400
+        instead of returning it; the finished result must still be kept."""
+        provider, client = responses_provider(
+            cancel=bad_request("Cannot cancel a completed response."),
+            retrieve=responses_result(text_message(ANSWER)),
+        )
+        outcome = await provider.cancel_background("resp_1", timeout=30.0)
+        assert outcome.done and outcome.error is None
+        assert outcome.response.text == ANSWER
+        assert client.calls["retrieve"][0][0] == ("resp_1",)
+
+    @pytest.mark.asyncio
+    async def test_cancel_rejected_for_a_failed_response_reports_the_failure(self):
+        provider, _ = responses_provider(
+            cancel=bad_request("Cannot cancel a failed response."),
+            retrieve=responses_result(status="failed", error=SimpleNamespace(message="boom")),
+        )
+        outcome = await provider.cancel_background("resp_1", timeout=30.0)
+        assert outcome.done and outcome.response is None
+        assert "boom" in outcome.error.message
+
+    @pytest.mark.asyncio
+    async def test_cancel_400_on_a_running_response_still_raises(self):
+        provider, _ = responses_provider(
+            cancel=bad_request("Something else is wrong."),
+            retrieve=SimpleNamespace(id="resp_1", status="in_progress"),
+        )
+        with pytest.raises(ProviderError) as exc:
+            await provider.cancel_background("resp_1", timeout=30.0)
+        assert exc.value.error_type == "bad_request"
+        assert "Something else" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_cancel_non_400_errors_are_not_masked(self):
+        import httpx
+        from openai import RateLimitError
+
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses/resp_1/cancel")
+        err = RateLimitError("slow down", response=httpx.Response(429, request=request), body=None)
+        provider, client = responses_provider(cancel=err)
+        with pytest.raises(ProviderError) as exc:
+            await provider.cancel_background("resp_1", timeout=30.0)
+        assert exc.value.error_type == "rate_limit"
+        assert client.calls["retrieve"] == []
+
+    @pytest.mark.asyncio
     async def test_cancel_with_lagging_status_counts_as_cancelled(self):
         provider, _ = responses_provider(cancel=SimpleNamespace(id="resp_1", status="in_progress"))
         outcome = await provider.cancel_background("resp_1", timeout=30.0)
