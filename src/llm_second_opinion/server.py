@@ -394,7 +394,10 @@ def build_server(
 
         submit_budget = jobs_mod.SUBMIT_BUDGET_SECONDS
 
-        if request_key:
+        async def existing_job_result() -> dict[str, Any] | None:
+            """The result for a job already holding `request_key`, or None."""
+            if not request_key:
+                return None
             existing = jobs.find_by_key(request_key)
             if existing is not None and existing.status == STATUS_SUBMITTING:
                 # A concurrent submit with this key is awaiting upstream
@@ -422,16 +425,23 @@ def build_server(
                 # Registered as running, or released after a failed submission
                 # (in which case this call proceeds as a fresh submission).
                 existing = jobs.find_by_key(request_key)
-            if existing is not None:
-                log.info(
-                    "rid=%s tool=submit_second_opinion outcome=deduplicated jid=%s "
-                    "status=%s elapsed_ms=%d",
-                    request_id, existing.job_id, existing.status, elapsed_ms(),
-                )
-                return _submit_result(request_id, existing, config, reused=True)
+            if existing is None:
+                return None
+            log.info(
+                "rid=%s tool=submit_second_opinion outcome=deduplicated jid=%s "
+                "status=%s elapsed_ms=%d",
+                request_id, existing.job_id, existing.status, elapsed_ms(),
+            )
+            return _submit_result(request_id, existing, config, reused=True)
 
-        # After the request_key lookup (the key identifies the job, §17.6)
-        # and before any upstream work (§17.4). Bounded by the submit budget:
+        # Looked up before the attachments load: the key identifies the job,
+        # not the content (§17.6), so a retry whose files have since changed
+        # or vanished still gets the existing job.
+        existing = await existing_job_result()
+        if existing is not None:
+            return existing
+
+        # Before any upstream work (§17.4). Bounded by the submit budget:
         # a submit is a fast call, and 30 s + 30 s + grace still clears the
         # client cap by the §7 margin.
         attachments, failure = await _load_attachments_or_error(
@@ -441,6 +451,14 @@ def build_server(
         )
         if failure is not None:
             return failure
+
+        # The load yields the event loop, so a duplicate submit may have
+        # claimed the key meanwhile. Look again; from here to `reserve` /
+        # `register` there is no await, so this lookup and the claim are
+        # atomic, as they were before attachments existed.
+        existing = await existing_job_result()
+        if existing is not None:
+            return existing
 
         if jobs.at_capacity():
             active = jobs.active()

@@ -76,7 +76,7 @@ Claude will call `submit_second_opinion` (or `second_opinion` for a short file) 
 
 Things to know:
 
-- **Attachments are off until the server is told where files may come from.** The operator sets `attachment_roots` in `config.json` (or `LLM_SECOND_OPINION_ATTACHMENT_ROOTS`) to the directories that are fair game. Until then, any attachment fails fast with `invalid_input` and a message naming `attachment_roots`. Files outside those directories — including via `..` or symlinks — are refused, as are secrets-shaped names (`config*.json`, `.env*`, `*.pem`, `*.key`, `id_rsa*`, and any dotfile).
+- **Attachments are off until the server is told where files may come from.** The operator sets `attachment_roots` in `config.json` (or `LLM_SECOND_OPINION_ATTACHMENT_ROOTS`) to the directories that are fair game. Until then, any attachment fails fast with `invalid_input` and a message naming `attachment_roots`. Files outside those directories — including via `..` or symlinks — are refused, as are secrets-shaped names (`config*.json`, `.env*`, `*.pem`, `*.key`, `id_rsa*`, and any dotfile) and anything inside a dot-directory such as `.git/` or `.claude/`.
 - **Text only, 1 MB total.** Files must be UTF-8 text; the total across all attachments on one call is capped at `max_attachment_bytes` (1,000,000 by default, roughly 250K tokens). Over the cap, the call fails before anything is sent, and the message says the total, the cap and the largest file.
 - **Content never enters the log.** The log records each file's name, size and a hash prefix — never its text, even with `log_prompts` on.
 - **Retries are safe.** If a submit's reply is lost and Claude re-issues it with the same `request_key`, you get the same job back — the key identifies the job, not the files.

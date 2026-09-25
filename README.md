@@ -306,7 +306,7 @@ This is the first place the server reads the filesystem at a model's direction, 
 | Control | Rule |
 |---|---|
 | Root allowlist | `attachment_roots` must be configured; it is empty by default and attachments are then refused with `invalid_input` naming the key. Each path is resolved with symlinks followed and must sit strictly inside a resolved root — `..`, symlink and junction escapes, and a sibling directory that merely shares a prefix (`/a/bc` against root `/a/b`) are all refused. Containment is case-insensitive and drive-aware on Windows |
-| Denylist | Regardless of roots: `config*.json`, `.env*`, `*.pem`, `*.key`, `id_rsa*`, `*.p12`, `*.pfx` and any dotfile are refused |
+| Denylist | Regardless of roots: `config*.json`, `.env*`, `*.pem`, `*.key`, `id_rsa*`, `*.p12`, `*.pfx` and any dotfile are refused, as is any file inside a dot-directory below the root (`.git/`, `.claude/`) |
 | Regular files only | Directories, devices and sockets are refused; a missing file is `invalid_input`, never `internal_error` |
 | UTF-8 text only | A file that does not decode as strict UTF-8 is refused naming the file. Binary, PDF and image attachments are not supported in 0.2.1 |
 | Size cap | `max_attachment_bytes` (default 1,000,000, roughly 250K tokens) across all files on one call, checked from `stat()` before anything is read or sent; the message states the total, the cap and the largest file |

@@ -119,6 +119,26 @@ def is_denied_name(name: str) -> bool:
     return any(fnmatch.fnmatchcase(lowered, pattern) for pattern in DENYLIST_PATTERNS)
 
 
+def hidden_dir_under_root(candidate: PurePath, roots: list[Path]) -> str | None:
+    """The first dot-directory between a containing root and `candidate`, or
+    None. A root set to a whole project folder would otherwise expose
+    `.git/config` or `.claude/settings.local.json`, whose basenames pass
+    `is_denied_name`. Components of the root itself are not checked, so a
+    root such as `~/.claude/briefs` still works; when several roots contain
+    the file, it is allowed if any one of them reaches it without a
+    dot-directory. Both sides are expected to be resolved."""
+    found: str | None = None
+    for root in roots:
+        if not is_strictly_inside(candidate, root):
+            continue
+        dirs = candidate.parts[len(root.parts):-1]
+        hidden = next((d for d in dirs if d.startswith(".")), None)
+        if hidden is None:
+            return None
+        found = found or hidden
+    return found
+
+
 def resolve_roots(roots: list[str]) -> list[Path]:
     """Resolve configured roots with symlinks followed. A root that does not
     exist is kept (it simply contains nothing) — config warns about it."""
@@ -181,6 +201,12 @@ def load_attachments(
             raise AttachmentError(
                 f"attachment {raw!r} is refused by name: dotfiles and files matching "
                 f"{', '.join(DENYLIST_PATTERNS)} are never attachable."
+            )
+        hidden = hidden_dir_under_root(resolved, resolved_roots)
+        if hidden is not None:
+            raise AttachmentError(
+                f"attachment {raw!r} is inside the dot-directory {hidden!r}; files "
+                f"under dot-directories (such as .git or .claude) are never attachable."
             )
 
         if resolved.is_dir():
@@ -259,6 +285,7 @@ __all__ = [
     "AttachmentError",
     "DENYLIST_PATTERNS",
     "DIGEST_LOG_CHARS",
+    "hidden_dir_under_root",
     "is_denied_name",
     "is_strictly_inside",
     "load_attachments",
