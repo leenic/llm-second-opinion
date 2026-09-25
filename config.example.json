@@ -22,5 +22,7 @@
   "request_budget_seconds": 200,
   "job_budget_seconds": 900,
   "default_max_tokens": 32000,
+  "attachment_roots": [],
+  "max_attachment_bytes": 1000000,
   "log_prompts": false
 }

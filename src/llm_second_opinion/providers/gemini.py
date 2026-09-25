@@ -76,6 +76,11 @@ class GeminiProvider(Provider):
         kwargs: dict[str, Any] = {
             "model": self.model,
             "input": self.build_user_content(req),
+            # The synchronous path asks Google not to retain the interaction
+            # (DESIGN §18.1; interactions are stored by default). Background
+            # submission removes it: `store=false` is incompatible with
+            # background execution.
+            "store": False,
         }
         if req.system_prompt:
             kwargs["system_instruction"] = req.system_prompt
@@ -136,12 +141,14 @@ class GeminiProvider(Provider):
     # it is then polled with `interactions.get(id=…)` and stopped with
     # `interactions.cancel(id=…)`. Interactions are stored by default (paid
     # tier: 55 days, free tier: 1 day) and `store=false` is incompatible with
-    # background execution, so nothing about storage is sent here.
+    # background execution, so the sync path's `store: false` is dropped here
+    # and nothing about storage is sent.
 
     supports_background = True
 
     async def submit_background(self, req: SecondOpinionRequest, timeout: float) -> str:
         kwargs = self._build_kwargs(req)
+        kwargs.pop("store", None)
         kwargs["background"] = True
         client = self._client()
         response = await self._call(lambda: client.aio.interactions.create(**kwargs), timeout)
@@ -175,23 +182,12 @@ class GeminiProvider(Provider):
 
     def _classify(self, response: Any) -> BackgroundPoll:
         """Map a retrieved Interaction to a BackgroundPoll: `queued` /
-        `in_progress` ⇒ running; `requires_action` ⇒ terminal failure; any
-        other status through `_build_response`, the synchronous path's code."""
+        `in_progress` ⇒ running; every other status through
+        `_build_response`, the synchronous path's code, so the terminal
+        mappings (§18.2) are identical on both."""
         status = getattr(response, "status", None)
         if status in _NON_TERMINAL_STATUSES:
             return BackgroundPoll(False, upstream_status=status)
-        if status == "requires_action":
-            # Paused for client tool input — nothing here will ever provide it.
-            return BackgroundPoll(
-                True,
-                error=ProviderError(
-                    "upstream_error",
-                    "gemini interaction paused waiting for client input "
-                    "(status=requires_action), which this server does not support",
-                    retriable=False,
-                ),
-                upstream_status=status,
-            )
         try:
             return BackgroundPoll(
                 True, response=self._build_response(response, 0), upstream_status=status
@@ -205,28 +201,75 @@ class GeminiProvider(Provider):
         Shared by the synchronous path and the background poller, so the
         status mappings are identical on both.
         """
+        # Terminal-status map (DESIGN §18.2), mirroring the Responses family:
+        # `content_blocked` is produced only on an explicit block/safety
+        # signal — `incomplete` is a token-cap outcome, not a safety one.
         status = getattr(response, "status", None)
+        block = _block_signal(response)
         if status == "failed":
+            detail = _error_detail(response)
+            raise ProviderError(
+                "content_blocked" if block else "upstream_error",
+                f"gemini interaction failed (status=failed"
+                f"{', ' + detail if detail else ''})",
+                retriable=False,
+            )
+        if status == "incomplete":
+            if block:
+                raise ProviderError(
+                    "content_blocked",
+                    f"gemini interaction was blocked (status=incomplete, {block})",
+                    retriable=False,
+                )
+            usage = _extract_usage(response)
+            reasoning_tokens = usage.reasoning_tokens if usage else None
             raise ProviderError(
                 "upstream_error",
-                f"gemini interaction failed (status={status})",
+                f"gemini interaction was cut short (status=incomplete, "
+                f"reasoning_tokens={reasoning_tokens}) — most likely the reply hit "
+                f"max_tokens. Retry with a higher max_tokens, a lower "
+                f"reasoning_effort, or omit max_tokens entirely.",
+                retriable=True,
+            )
+        if status == "cancelled":
+            raise ProviderError(
+                "upstream_error",
+                "gemini interaction was cancelled upstream (status=cancelled)",
                 retriable=False,
             )
         if status == "budget_exceeded":
             raise ProviderError(
                 "upstream_error",
-                f"gemini interaction exceeded its budget (status={status})",
+                "gemini interaction exceeded its budget (status=budget_exceeded). "
+                "Retry with a narrower prompt, a lower reasoning_effort, or "
+                "web_search off.",
+                retriable=True,
+            )
+        if status == "requires_action":
+            # Paused for client tool input — impossible in single-turn use, so
+            # its appearance is diagnostic, not retriable.
+            raise ProviderError(
+                "upstream_error",
+                "gemini interaction paused waiting for client input "
+                "(status=requires_action), which this server does not support",
                 retriable=False,
             )
-        if status in ("cancelled", "incomplete"):
+        if status != "completed":
             raise ProviderError(
-                "content_blocked",
-                f"gemini interaction did not complete (status={status})",
+                "upstream_error",
+                f"gemini interaction ended with an unrecognised status "
+                f"{status!r}" + (" (status missing)" if status is None else ""),
                 retriable=False,
             )
 
         text = _join_output_text(response).strip()
         if not text:
+            if block:
+                raise ProviderError(
+                    "content_blocked",
+                    f"gemini returned no text and reported a block ({block})",
+                    retriable=False,
+                )
             raise ProviderError(
                 "upstream_error",
                 f"gemini returned no text output (status={status!r})",
@@ -286,6 +329,62 @@ def _translate_genai_error(e: genai_errors.APIError) -> ProviderError:
         return ProviderError("bad_request", f"gemini rejected request ({status}): {msg}",
                              retriable=False, status=status)
     return ProviderError("upstream_error", f"gemini error: {msg}", retriable=False)
+
+
+# Vocabulary that marks an error as a safety/content block rather than a
+# capacity or transport failure. Matched case-insensitively against the
+# Interaction's `errors[*]` code/message, each step's `error` (a gRPC-style
+# Status), and any block/finish-reason attribute a future SDK may add.
+_BLOCK_VOCABULARY = (
+    "safety",
+    "blocked",
+    "block_reason",
+    "blocklist",
+    "prohibited",
+    "recitation",
+    "content_filter",
+)
+
+
+def _block_signal(response: Any) -> str | None:
+    """The block/safety signal on an Interaction, or None when there is none.
+
+    `content_blocked` is only ever produced when this returns a value (§18.2).
+    Everything is read through `getattr` so the SimpleNamespace fakes and
+    future SDK model classes both work.
+    """
+    candidates: list[Any] = []
+    for err in getattr(response, "errors", None) or []:
+        candidates.append(getattr(err, "code", None))
+        candidates.append(getattr(err, "message", None))
+    for step in getattr(response, "steps", None) or []:
+        err = getattr(step, "error", None)
+        if err is not None:
+            candidates.append(getattr(err, "message", None))
+            candidates.append(getattr(err, "details", None))
+    for attr in ("block_reason", "finish_reason", "incomplete_reason"):
+        candidates.append(getattr(response, attr, None))
+    incomplete = getattr(response, "incomplete_details", None)
+    if incomplete is not None:
+        candidates.append(getattr(incomplete, "reason", None))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        text = str(candidate)
+        lowered = text.lower()
+        if any(word in lowered for word in _BLOCK_VOCABULARY):
+            return text
+    return None
+
+
+def _error_detail(response: Any) -> str:
+    """`code: message` of the first reported error, for failure messages."""
+    for err in getattr(response, "errors", None) or []:
+        code = getattr(err, "code", None)
+        message = getattr(err, "message", None)
+        if code or message:
+            return f"{code or 'error'}: {message or ''}".strip(": ")
+    return ""
 
 
 def _join_output_text(response: Any) -> str:

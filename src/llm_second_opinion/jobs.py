@@ -101,6 +101,11 @@ class JobRecord:
     max_tokens: int | None = None
     focus: bool = False
     request_key: str | None = None
+    # Attachment echo (DESIGN §17.4/§17.6): `[{name, bytes}]` for the result
+    # envelopes plus the full sha256 per file for the log — metadata only,
+    # never content.
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    attachment_digests: list[str] = field(default_factory=list)
     # The provider adapter instance the job was submitted through; the
     # pollers and cancel need it. `provider` above is its name, for logs.
     adapter: Any = None
