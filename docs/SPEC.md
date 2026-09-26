@@ -1,6 +1,6 @@
 # llm-second-opinion — System Specification
 
-**Version:** 0.2.1 · **Status:** current as of 2026-09-11 · **Audience:** contributors extending the server
+**Version:** 0.2.2 · **Status:** current as of 2026-09-26 · **Audience:** contributors extending the server
 
 > **0.2.0 amendment.** The submit/poll background-job extension specified in
 > [DESIGN-submit-poll.md](DESIGN-submit-poll.md) has landed. This document has been amended where the
@@ -11,6 +11,10 @@
 > `attachment_paths` on both review tools with the §17.4 guardrails (`attachments.py`), `store: false` on the
 > synchronous path, the Gemini terminal-status remap, per-provider `reasoning_effort` sets, and the privacy
 > wording rewrite. Amended here: §3, §5, §6.1, §6.4, §7, §9.1, §9.4, §12, §13, §14, §15.
+>
+> **0.2.2 amendment.** Patch release: the `request_key` lookup on submit runs again after attachments
+> load, so concurrent same-key submits with attachments start one job (§6.4), and files under a
+> dot-directory below their root are refused (§6.1).
 
 This document specifies what the application *does today*, precisely enough to serve as the foundation for
 extensions. It is derived from an exhaustive review of the codebase (all source, tests, configuration, packaging,
@@ -59,7 +63,7 @@ This is enforced by tests (§14).
 
 | Path | Role |
 |---|---|
-| `src/llm_second_opinion/__init__.py` | Package marker; `__version__ = "0.2.1"` |
+| `src/llm_second_opinion/__init__.py` | Package marker; `__version__ = "0.2.2"` |
 | `src/llm_second_opinion/__main__.py` | `python -m llm_second_opinion` entry point |
 | `src/llm_second_opinion/server.py` | FastMCP server, all five tools, timing/cancellation logic, the background-job drivers, error envelopes |
 | `src/llm_second_opinion/jobs.py` | Background-job record, state machine, in-memory registry with `request_key` index and lazy TTL eviction, timing-model-v2 constants (no asyncio driving code) |
@@ -190,7 +194,7 @@ Send a summary to one external LLM and return its independent, critical reply.
 | `system_prompt` | `str \| None` | no | Replaces the default reviewer prompt; blank/whitespace falls back to the default. |
 | `temperature` | `float \| None` | no | Passed through when set. If the model rejects it, it is dropped and retried once (§9.3). |
 | `max_tokens` | `int \| None` | no | Output cap. `None` ⇒ `default_max_tokens` applies. The check is `is not None`, so an explicit `0` is honoured, not replaced by the default. |
-| `attachment_paths` | `list[str] \| None` | no | (0.2.1) Local files the **server** reads and splices into the user message after `summary`, in order (§7). Guarded by `attachments.load_attachments` per design §17.4: roots allowlist (empty ⇒ disabled, `invalid_input` naming `attachment_roots`), strict containment after resolving symlinks (components compared, case-insensitive and drive-aware on Windows), basename denylist, regular files only, strict UTF-8, `max_attachment_bytes` total checked from `stat()` before any read; the read itself is bound to the validated file (`os.fstat` of the opened handle must be the same regular file, by `(st_dev, st_ino)`, that pass 1 stat()ed — a path or parent swapped for a link in between is refused). Every refusal is `invalid_input` (never `internal_error`) and precedes provider construction, so nothing is sent upstream. Loading runs in a worker thread under `_run_bounded` with the call's budget (`request_budget_seconds` here, `SUBMIT_BUDGET_SECONDS` on submit): overrun ⇒ a retriable `timeout`, and the sync provider bound is charged only the remaining budget, so the whole call clears the cap (invariant 3). |
+| `attachment_paths` | `list[str] \| None` | no | (0.2.1) Local files the **server** reads and splices into the user message after `summary`, in order (§7). Guarded by `attachments.load_attachments` per design §17.4: roots allowlist (empty ⇒ disabled, `invalid_input` naming `attachment_roots`), strict containment after resolving symlinks (components compared, case-insensitive and drive-aware on Windows), basename denylist, no dot-directory between the containing root and the file (a root's own components are not checked), regular files only, strict UTF-8, `max_attachment_bytes` total checked from `stat()` before any read; the read itself is bound to the validated file (`os.fstat` of the opened handle must be the same regular file, by `(st_dev, st_ino)`, that pass 1 stat()ed — a path or parent swapped for a link in between is refused). Every refusal is `invalid_input` (never `internal_error`) and precedes provider construction, so nothing is sent upstream. Loading runs in a worker thread under `_run_bounded` with the call's budget (`request_budget_seconds` here, `SUBMIT_BUDGET_SECONDS` on submit): overrun ⇒ a retriable `timeout`, and the sync provider bound is charged only the remaining budget, so the whole call clears the cap (invariant 3). |
 
 **Handler flow** (`server.build_server → second_opinion`):
 
@@ -319,7 +323,10 @@ this section records what was built.
   matches a known job (running *or* terminal, until eviction) returns that job's submit shape with
   `"reused_existing_job": true` and no upstream call — the key identifies the job, not its content, so
   different attachments under a reused key still return the existing job (design §17.6); attachments are
-  loaded and guarded *after* the key lookup and before the capacity check; the active-job cap returns
+  loaded and guarded *after* the key lookup and before the capacity check. Because the load awaits a worker
+  thread, the key lookup (including the wait on a still-`submitting` reservation) runs **again** after it: a
+  duplicate that arrived during the load has claimed the key by then, and from this second lookup to
+  `reserve`/`register` there is no await, so lookup and claim are atomic; the active-job cap returns
   `job_limit`; otherwise a `JobRecord` is created and started per the
   provider's backing. Provider-backed (`supports_background`): the record is **reserved** first
   (`JobRegistry.reserve` holds a capacity slot and the `request_key` while still `submitting`; `get()` hides

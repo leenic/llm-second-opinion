@@ -302,6 +302,42 @@ class TestDenylist:
         path = write(root / name, "x")
         assert load_attachments([str(path)], [str(root)], 1000)[0].name == name
 
+    @pytest.mark.parametrize("rel", [
+        ".git/config", ".claude/settings.local.json", "sub/.venv/pyvenv.cfg", ".a/b/c.md",
+    ])
+    def test_files_under_a_dot_directory_are_refused(self, root, rel):
+        """A root set to a whole project must not expose .git or tool settings,
+        whose basenames alone pass the name check."""
+        path = write(root / rel, "x")
+        with pytest.raises(AttachmentError, match="dot-directory"):
+            load_attachments([str(path)], [str(root)], 1000)
+
+    def test_dot_directory_in_the_root_itself_is_allowed(self, tmp_path):
+        """Only components below the root are checked: `~/.claude/briefs` works."""
+        r = tmp_path / ".claude" / "briefs"
+        path = write(r / "brief.md", "x")
+        assert load_attachments([str(path)], [str(r)], 1000)[0].name == "brief.md"
+
+    def test_a_root_that_reaches_the_file_without_a_dot_directory_admits_it(self, tmp_path):
+        """With nested roots, the dot-directory under the outer root does not
+        veto a file the inner root contains directly."""
+        outer = tmp_path / "project"
+        inner = outer / ".claude" / "briefs"
+        path = write(inner / "brief.md", "x")
+        with pytest.raises(AttachmentError, match="dot-directory"):
+            load_attachments([str(path)], [str(outer)], 1000)
+        assert load_attachments([str(path)], [str(outer), str(inner)], 1000)
+
+    def test_symlink_into_a_dot_directory_is_refused(self, root):
+        target = write(root / ".git" / "config", "x")
+        link = root / "notes.md"
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError):
+            pytest.skip("cannot create file symlinks here")
+        with pytest.raises(AttachmentError, match="dot-directory"):
+            load_attachments([str(link)], [str(root)], 1000)
+
 
 class TestFileType:
     def test_missing_file_is_invalid_input_not_internal(self, root):
@@ -502,6 +538,55 @@ class TestEnvelopeEcho:
         assert first["job_id"] == second["job_id"]
         assert second["attachments"] == [{"name": "a.md", "bytes": 6}]
         assert len(provider.requests) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("backing", ["local_task", "provider_background"])
+    @pytest.mark.parametrize("with_attachments", [False, True])
+    async def test_concurrent_same_key_submits_create_one_job(
+        self, run, root, monkeypatch, backing, with_attachments
+    ):
+        """The attachment load awaits between the key lookup and the key
+        reservation; a duplicate arriving during it must still find the
+        first call's job rather than start a second billed one."""
+        import asyncio
+        import time
+
+        import llm_second_opinion.server as server_mod
+        from llm_second_opinion.jobs import JobRegistry
+        from test_jobs import BackgroundStub
+
+        real_load = server_mod.load_attachments
+
+        def slow_load(*a, **k):
+            time.sleep(0.05)  # hold both calls inside the load at once
+            return real_load(*a, **k)
+
+        monkeypatch.setattr(server_mod, "load_attachments", slow_load)
+
+        provider = BackgroundStub(submit_delay=0.02) if backing == "provider_background" else None
+        registry = JobRegistry()
+        _, provider = run(make_config([str(root)]), provider=provider, registry=registry)
+        server = build_server(make_config([str(root)]), registry=registry)
+        args = {"summary": "review this", "target_model": "grok", "request_key": "same-key"}
+        if with_attachments:
+            args["attachment_paths"] = [str(write(root / "doc.md", "hello\n"))]
+
+        async def submit():
+            result = await server.call_tool("submit_second_opinion", args)
+            return result[1] if isinstance(result, tuple) else result
+
+        try:
+            first, second = await asyncio.gather(submit(), submit())
+            assert first["success"] and second["success"], (first, second)
+            assert first["job_id"] == second["job_id"]
+            assert len(provider.requests) == 1, "one upstream submission"
+            assert registry.find_by_key("same-key").job_id == first["job_id"]
+        finally:
+            for rec in list(registry._jobs.values()):
+                for task in (rec.driver, rec.task):
+                    if task is not None and not task.done():
+                        task.cancel()
+            await asyncio.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
