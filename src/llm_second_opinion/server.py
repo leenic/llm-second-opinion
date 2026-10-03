@@ -37,14 +37,12 @@ from .jobs import (
 from .providers import (
     PROVIDER_TO_TARGET,
     TARGET_TO_PROVIDER,
+    PROVIDER_CLASSES,
     ProviderError,
     SecondOpinionRequest,
     build_provider,
 )
 from .providers.base import BackgroundPoll, SecondOpinionResponse, build_user_content
-from .providers.gemini import GeminiProvider
-from .providers.grok import GrokProvider
-from .providers.openai_provider import OpenAIProvider
 
 # How long a cancelled provider task gets to tear down before we return
 # anyway. Kept small so `request_budget_seconds` + this still clears the MCP
@@ -78,7 +76,7 @@ UNTRUSTED_OUTPUT_STEERING = (
 # §3.4): they encode the polling protocol, because nothing server-side can
 # make a Desktop session poll sanely.
 SECOND_OPINION_DESCRIPTION = (
-    "Send a summary to an external LLM (Gemini, Grok, or ChatGPT) and "
+    "Send a summary to an external LLM (Gemini, Grok, ChatGPT, or Claude) and "
     "return its independent, critical second opinion. Best for quick "
     "questions that finish well inside the per-call time cap. For "
     "heavyweight reviews (large documents, web search, high reasoning "
@@ -88,8 +86,8 @@ SECOND_OPINION_DESCRIPTION = (
 )
 
 SUBMIT_DESCRIPTION = (
-    "Start a second-opinion review from an external LLM (Gemini, Grok, or "
-    "ChatGPT) as a background job and return a job_id within seconds. Use "
+    "Start a second-opinion review from an external LLM (Gemini, Grok, "
+    "ChatGPT, or Claude) as a background job and return a job_id within seconds. Use "
     "this for heavyweight reviews — large documents, web search, high "
     "reasoning effort — that may take minutes. After submitting, call "
     "get_second_opinion with wait_seconds=45; if the job is still running, "
@@ -138,7 +136,7 @@ def build_server(
     @mcp.tool(description=SECOND_OPINION_DESCRIPTION)
     async def second_opinion(
         summary: str,
-        target_model: Literal["gemini", "grok", "chatgpt"],
+        target_model: Literal["gemini", "grok", "chatgpt", "claude"],
         focus: str | None = None,
         system_prompt: str | None = None,
         temperature: float | None = None,
@@ -157,7 +155,7 @@ def build_server(
         Args:
             summary: The content to review, or the framing and instructions
                 for reviewing the attachments. Required.
-            target_model: One of "gemini", "grok", or "chatgpt".
+            target_model: One of "gemini", "grok", "chatgpt", or "claude".
             focus: Optional aspect to prioritise in the review.
             system_prompt: Optional override for the default reviewer prompt.
             temperature: Optional sampling temperature.
@@ -334,7 +332,7 @@ def build_server(
     @mcp.tool(description=SUBMIT_DESCRIPTION)
     async def submit_second_opinion(
         summary: str,
-        target_model: Literal["gemini", "grok", "chatgpt"],
+        target_model: Literal["gemini", "grok", "chatgpt", "claude"],
         focus: str | None = None,
         system_prompt: str | None = None,
         temperature: float | None = None,
@@ -358,7 +356,7 @@ def build_server(
         Args:
             summary: The content to review, or the framing and instructions
                 for reviewing the attachments. Required.
-            target_model: One of "gemini", "grok", or "chatgpt".
+            target_model: One of "gemini", "grok", "chatgpt", or "claude".
             focus: Optional aspect to prioritise in the review.
             system_prompt: Optional override for the default reviewer prompt.
             temperature: Optional sampling temperature.
@@ -814,7 +812,7 @@ def build_server(
 
     @mcp.tool(
         description=(
-            "Return the providers (gemini, grok, chatgpt) that are configured "
+            "Return the providers (gemini, grok, chatgpt, claude) that are configured "
             "with an API key and pass a basic reachability check."
         )
     )
@@ -1207,8 +1205,8 @@ def _unknown_job_message(job_id: Any, jobs: JobRegistry) -> str:
         f"No job {job_id!r} is known to this server. Either the id is mistyped, "
         f"the job finished more than {jobs.ttl_seconds / 60:.0f} minutes ago and its "
         f"result was evicted (expired), or the server restarted since it was "
-        f"submitted. A restart loses the job registry: grok-backed jobs die with the "
-        f"process; chatgpt- and gemini-backed jobs finish (and are billed) upstream "
+        f"submitted. A restart loses the job registry: grok- and claude-backed jobs "
+        f"die with the process; chatgpt- and gemini-backed jobs finish (and are billed) upstream "
         f"but their results are unreachable from here. Submit again."
     )
 
@@ -1370,16 +1368,11 @@ async def _check_all_providers(config: AppConfig) -> list[dict[str, Any]]:
             reasoning_effort=pcfg.reasoning_effort,
             web_search=pcfg.web_search,
         )
-        if provider_key == "openai":
-            provider: Any = OpenAIProvider(**kwargs)
-        elif provider_key == "grok":
-            provider = GrokProvider(**kwargs)
-        elif provider_key == "gemini":
-            provider = GeminiProvider(**kwargs)
-        else:
+        cls = PROVIDER_CLASSES.get(provider_key)
+        if cls is None:
             items.append((target_model, provider_key, "unsupported_provider"))
             continue
-        items.append((target_model, provider_key, provider))
+        items.append((target_model, provider_key, cls(**kwargs)))
 
     async def _probe(provider: Any) -> tuple[bool, str | None]:
         try:

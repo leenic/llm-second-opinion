@@ -27,7 +27,8 @@ and documentation). Where behaviour is intentional and load-bearing, it is calle
 
 `llm-second-opinion` is a **local MCP (Model Context Protocol) server** that gives a Claude session (Claude Code
 or Claude Desktop) the ability to obtain an **independent, critical second opinion** from a competing LLM vendor
-— OpenAI (ChatGPT), Google (Gemini), or xAI (Grok).
+— OpenAI (ChatGPT), Google (Gemini), or xAI (Grok) — or from a *different* Claude model via Anthropic's API
+(e.g. a Claude Opus 5.5 session asking Claude Fable 5.1).
 
 The design goal is *not* to outvote Claude but to close information gaps: different training corpora, different
 web-search behaviour, different perspectives. Claude remains the driver; the second opinion is one more
@@ -75,6 +76,7 @@ This is enforced by tests (§14).
 | `src/llm_second_opinion/providers/openai_provider.py` | `ResponsesAPIProvider` base + `OpenAIProvider`; final-answer extraction; droppable-param retry |
 | `src/llm_second_opinion/providers/grok.py` | `GrokProvider` — `ResponsesAPIProvider` with xAI base URL |
 | `src/llm_second_opinion/providers/gemini.py` | `GeminiProvider` — Google Interactions API adapter |
+| `src/llm_second_opinion/providers/anthropic_provider.py` | `AnthropicProvider` — Anthropic Messages API adapter (streamed) |
 | `tests/` | Pytest suite (see §14) |
 | `config.example.json` | Placeholder config shipped with the repo |
 | `README.md` / `USAGE.md` | Operator setup reference / end-user walkthrough |
@@ -125,14 +127,14 @@ enter version control.
 
 ### 5.2 Resolved model (`AppConfig` / `ProviderConfig` dataclasses)
 
-Per provider (`openai`, `gemini`, `grok` — the keys of `DEFAULT_MODELS`; every provider always gets a
+Per provider (`openai`, `anthropic`, `gemini`, `grok` — the keys of `DEFAULT_MODELS`; every provider always gets a
 `ProviderConfig` entry even when absent from the file):
 
 | Field | Resolution (highest precedence first) | Validation / semantics |
 |---|---|---|
 | `api_key` | env `LLM_SECOND_OPINION_<NAME>_API_KEY` → file `providers.<name>.api_key` | Blank or containing `REPLACE-ME` ⇒ `None` ⇒ provider **unavailable** (server still runs) |
-| `model` | env `…_<NAME>_MODEL` → file `model` → `DEFAULT_MODELS[name]` | Defaults: `openai: gpt-6-astra`, `gemini: gemini-3.8-flash`, `grok: grok-4.7` (each vendor's current flagship — the env override exists so a new flagship needs no code change) |
-| `reasoning_effort` | env `…_<NAME>_REASONING_EFFORT` → file value | Normalised (strip + lowercase); must be in **that provider's** `REASONING_EFFORTS_BY_PROVIDER[name]` set else `ConfigError` naming the provider and its allowed values (0.2.1 — the sets differ by vendor and are sourced from primary docs, cited in `config.py`); unset/empty ⇒ `None` ⇒ SDK default thinking depth (reasoning **on** for all three current flagships) |
+| `model` | env `…_<NAME>_MODEL` → file `model` → `DEFAULT_MODELS[name]` | Defaults: `openai: gpt-6-astra`, `anthropic: claude-fable-5-1`, `gemini: gemini-3.8-flash`, `grok: grok-4.7` (each vendor's current flagship; for Anthropic the most capable model, deliberately not the Opus a Claude caller is most likely running — the env override exists so a new flagship needs no code change) |
+| `reasoning_effort` | env `…_<NAME>_REASONING_EFFORT` → file value | Normalised (strip + lowercase); must be in **that provider's** `REASONING_EFFORTS_BY_PROVIDER[name]` set else `ConfigError` naming the provider and its allowed values (0.2.1 — the sets differ by vendor and are sourced from primary docs, cited in `config.py`); unset/empty ⇒ `None` ⇒ SDK default thinking depth (reasoning **on** for all four current flagships) |
 | `web_search` | env `…_<NAME>_WEB_SEARCH` (truthy: `1/true/yes/on`) → file boolean → `False` | Non-boolean file value is ignored (treated as `False`) |
 
 Top-level:
@@ -176,7 +178,7 @@ control calls), `MAX_POLL_WAIT_SECONDS = 45.0`, `POLL_INTERVAL_SECONDS = 4.0`, `
 Server name: `llm-second-opinion`. Five tools: the synchronous `second_opinion` (§6.1), `list_available_models`
 (§6.2), and the background-job trio `submit_second_opinion` / `get_second_opinion` / `cancel_second_opinion`
 (§6.4). Tool schemas are derived by FastMCP from the Python signatures — the `Literal["gemini", "grok",
-"chatgpt"]` annotation is what advertises the allowed `target_model` values to the client, and the docstring
+"chatgpt", "claude"]` annotation is what advertises the allowed `target_model` values to the client, and the docstring
 `Args:` entries feed the parameter descriptions. The tool *descriptions* are behavioural steering for the
 calling model (design §3.4): the sync tool's points heavyweight reviews at the job tools, and the job tools'
 encode the polling protocol (wait 45 s, then report progress and poll after `retry_after_ms`, never in a
@@ -189,7 +191,7 @@ Send a summary to one external LLM and return its independent, critical reply.
 | Arg | Type | Required | Semantics |
 |---|---|---|---|
 | `summary` | `str` | yes | The content to review. Must be non-empty after strip, else `invalid_input` (checked before any provider work). |
-| `target_model` | `Literal["gemini","grok","chatgpt"]` | yes | Which external LLM. Mapped to a provider via the registry (§8.3). |
+| `target_model` | `Literal["gemini","grok","chatgpt","claude"]` | yes | Which external LLM. Mapped to a provider via the registry (§8.3). |
 | `focus` | `str \| None` | no | Aspect to emphasise; prepended to the user message (§7). |
 | `system_prompt` | `str \| None` | no | Replaces the default reviewer prompt; blank/whitespace falls back to the default. |
 | `temperature` | `float \| None` | no | Passed through when set. If the model rejects it, it is dropped and retried once (§9.3). |
@@ -449,9 +451,13 @@ both rely on this.
 ### 8.3 Registry and factory (`providers/__init__.py`)
 
 ```python
-TARGET_TO_PROVIDER = {"chatgpt": "openai", "gemini": "gemini", "grok": "grok"}
+TARGET_TO_PROVIDER = {"chatgpt": "openai", "claude": "anthropic", "gemini": "gemini", "grok": "grok"}
 PROVIDER_TO_TARGET = inverse
+PROVIDER_CLASSES = {"openai": OpenAIProvider, "anthropic": AnthropicProvider, ...}
 ```
+
+`PROVIDER_CLASSES` is the single provider-key → adapter map; `build_provider` and the
+`list_available_models` probe both instantiate through it.
 
 `build_provider(target_model, config)`: validates the target (`invalid_input`), requires an API key
 (`missing_api_key` with actionable message), then instantiates the matching adapter with
@@ -614,6 +620,47 @@ storage is sent) and returns `response.id`; `poll_background` calls `interaction
 `queued`/`in_progress` ⇒ running; anything else through `_build_response`, so the status map above is
 identical on both paths. `cancel_background` calls `interactions.cancel(id=…)`.
 
+### 9.5 `AnthropicProvider` (Anthropic Messages API)
+
+Exists so a Claude caller can get a second opinion from a *different* Claude model. SDK `anthropic>=1.11,<2`.
+**Client:** `AsyncAnthropic(api_key, timeout=<budget>, max_retries=0)` — `max_retries=0` for the §9.1 reason.
+
+**Request** (`client.beta.messages.stream(...)`, collected with `get_final_message()`): `model`; `max_tokens`
+(mandatory on this API — `req.max_tokens`, or `UNBOUNDED_MAX_TOKENS = 64000` when the caller and
+`default_max_tokens` both leave it unset; 64000 is the largest output every current model accepts); `system`;
+one user message (§7); `output_config.effort` when `reasoning_effort` is set; `tools=[web_search_20260209]` when
+`web_search` is on. Streaming is used because the SDK refuses large non-streaming `max_tokens`; the whole call
+is still bounded by `asyncio.wait_for(timeout)`.
+
+- **`thinking` is never sent.** Current models run adaptive thinking when it is omitted, and Claude Fable 5.1 /
+  Opus 5.5 return 400 on any explicit non-adaptive setting. Depth is `output_config.effort` alone.
+- **Sampling is model-gated, not retried.** `temperature` is sent only to models in `SAMPLING_MODEL_PREFIXES`
+  (Claude 3.x, Haiku 4.x, Sonnet 4.x, Opus ≤ 4.6); Anthropic removed sampling parameters from Opus 4.7 onward,
+  so for those it is dropped up front (debug log) rather than spending a 400 round-trip as §9.3 does.
+- **Refusal fallback.** For models in `FALLBACK_MODEL_PREFIXES` (Fable 5.1, Opus 5.x, Sonnet 5.5) the request
+  carries `fallbacks: "default"` with beta `server-side-fallback-2026-07-01`: a safety-classifier decline is
+  re-run server-side on Anthropic's recommended substitute. `SecondOpinionResponse.model` is the response's
+  `model`, i.e. the model that actually answered.
+- **`pause_turn`** (server-side tool loop paused): the turn is re-sent with the paused assistant content
+  appended, at most `MAX_PAUSE_CONTINUATIONS = 5` times, each bounded by what remains of the one original
+  timeout. Usage is summed across the continuations.
+
+**Stop-reason map** (checked before `content` is read): `refusal` ⇒ `content_blocked` (with `stop_details`
+category/explanation; reaching it means any fallback declined too); `max_tokens` ⇒ retriable
+`upstream_error` naming `max_tokens`; `pause_turn` after the cap ⇒ retriable `upstream_error`;
+`model_context_window_exceeded` ⇒ `bad_request`; otherwise the trailing run of `text` blocks (same rule as
+§9.2 — narration before a search and a `fallback` switch block are excluded; adjacent cited text blocks are
+joined), empty ⇒ retriable `upstream_error`. **Usage:** input = `input_tokens` + cache creation + cache read;
+`reasoning_tokens` = `output_tokens_details.thinking_tokens`. **HTTP errors:** 401/403 ⇒ `auth_failed`,
+429 ⇒ `rate_limit`, 400/404/413/422 ⇒ `bad_request`, ≥500 incl. 529 overloaded ⇒ retriable `upstream_error`,
+timeout ⇒ `timeout`, connection ⇒ `network_error`. **Reachability:** `models.retrieve(model)` with a 5 s
+timeout (catches bad keys and unknown model ids).
+
+**No background mode** (`supports_background = False`): the Messages API has no submit/poll surface (Message
+Batches is a 24 h queue), so jobs run as local tasks. Nothing is retained as a retrievable object, so there is
+no `store` flag to send (§13); requests fall under the organisation's Anthropic retention terms — and Claude
+Fable 5.1 requires 30-day retention, so a zero-data-retention org gets `bad_request` on it.
+
 ## 10. Timing and cancellation model
 
 This is the most safety-critical subsystem. The forcing constraint: **Claude Desktop enforces a hard,
@@ -761,7 +808,8 @@ gpt ~21 s (`medium`), grok ~44–50 s (`high`); a long open-ended prompt pushes 
   and response: OpenAI stored responses (sent with `store: true`) persist under the account's retention
   policy; Google interactions are stored by default (55 days paid tier, 1 day free tier) and `store=false` is
   incompatible with background execution. The docs state this plainly and point at the synchronous tool when
-  it is unacceptable. Grok-backed jobs are an ordinary synchronous API call (`store: false`). Job records hold
+  it is unacceptable. Grok-backed jobs are an ordinary synchronous API call (`store: false`); Claude-backed jobs are an ordinary
+  Messages API call, which has no stored-response object to opt out of. Job records hold
   prompt-adjacent metadata in memory (model, effort, `web_search`, `max_tokens`, whether a focus was given,
   attachment names/sizes/digests) — never content — and `log_prompts` continues to gate every content log
   line; attachment content is never logged at all.

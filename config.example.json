@@ -17,6 +17,12 @@
       "model": "grok-4.7",
       "reasoning_effort": "medium",
       "web_search": false
+    },
+    "anthropic": {
+      "api_key": "sk-ant-REPLACE-ME",
+      "model": "claude-fable-5-1",
+      "reasoning_effort": "high",
+      "web_search": false
     }
   },
   "request_budget_seconds": 200,

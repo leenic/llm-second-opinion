@@ -15,6 +15,7 @@ def keyless_config() -> AppConfig:
         "openai": ProviderConfig(api_key=None, model="m"),
         "gemini": ProviderConfig(api_key=None, model="m"),
         "grok": ProviderConfig(api_key=None, model="m"),
+        "anthropic": ProviderConfig(api_key=None, model="m"),
     })
 
 

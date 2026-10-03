@@ -16,6 +16,9 @@ ENV_PREFIX = "LLM_SECOND_OPINION_"
 
 DEFAULT_MODELS = {
     "openai": "gpt-6-astra",
+    # Fable rather than Opus: the expected caller is a Claude session that is
+    # itself usually Opus, and a second opinion from the same model is not one.
+    "anthropic": "claude-fable-5-1",
     "gemini": "gemini-3.8-flash",
     "grok": "grok-4.7",
 }
@@ -97,6 +100,12 @@ REASONING_EFFORTS_BY_PROVIDER: dict[str, frozenset[str]] = {
     # `reasoning_effort` accepts low, medium, high, xhigh; xhigh is available
     # on grok-4.6 and later and is treated as high on grok-4.5.
     "grok": frozenset({"low", "medium", "high", "xhigh"}),
+    # Anthropic's Claude API reference (model table cached 2026-09-25):
+    # `output_config.effort` takes low, medium, high, xhigh, max on Claude
+    # Fable 5.1, Opus 5.5, and Sonnet 5.5. Unset, Opus 5.5 defaults to medium
+    # and the others to high. Claude Haiku 4.5 rejects
+    # the parameter entirely (surfaces as `bad_request`).
+    "anthropic": frozenset({"low", "medium", "high", "xhigh", "max"}),
 }
 
 
@@ -107,7 +116,7 @@ class ProviderConfig:
     # One of the provider's REASONING_EFFORTS_BY_PROVIDER values, or None to
     # leave the SDK default. For Gemini this is `thinking_level` on the
     # Interactions API; for OpenAI/Grok it is `reasoning.effort` on the
-    # Responses API.
+    # Responses API; for Anthropic it is `output_config.effort`.
     reasoning_effort: str | None = None
     # If true, attach the provider's built-in web search tool to every call.
     web_search: bool = False
