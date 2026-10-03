@@ -1,6 +1,6 @@
 # llm-second-opinion — System Specification
 
-**Version:** 0.2.2 · **Status:** current as of 2026-09-26 · **Audience:** contributors extending the server
+**Version:** 0.3.0 · **Status:** current as of 2026-10-03 · **Audience:** contributors extending the server
 
 > **0.2.0 amendment.** The submit/poll background-job extension specified in
 > [DESIGN-submit-poll.md](DESIGN-submit-poll.md) has landed. This document has been amended where the
@@ -15,6 +15,11 @@
 > **0.2.2 amendment.** Patch release: the `request_key` lookup on submit runs again after attachments
 > load, so concurrent same-key submits with attachments start one job (§6.4), and files under a
 > dot-directory below their root are refused (§6.1).
+>
+> **0.3.0 amendment.** New provider: `target_model: "claude"` → `AnthropicProvider` (Anthropic Messages API,
+> default `claude-fable-5-1`), so a Claude caller can get a second opinion from a different Claude model. It
+> runs jobs as local tasks and opts into server-side refusal fallback. Amended here: §1, §3, §5.2, §6, §8.3,
+> §9.5 (new), §13.
 
 This document specifies what the application *does today*, precisely enough to serve as the foundation for
 extensions. It is derived from an exhaustive review of the codebase (all source, tests, configuration, packaging,
@@ -64,7 +69,7 @@ This is enforced by tests (§14).
 
 | Path | Role |
 |---|---|
-| `src/llm_second_opinion/__init__.py` | Package marker; `__version__ = "0.2.2"` |
+| `src/llm_second_opinion/__init__.py` | Package marker; `__version__ = "0.3.0"` |
 | `src/llm_second_opinion/__main__.py` | `python -m llm_second_opinion` entry point |
 | `src/llm_second_opinion/server.py` | FastMCP server, all five tools, timing/cancellation logic, the background-job drivers, error envelopes |
 | `src/llm_second_opinion/jobs.py` | Background-job record, state machine, in-memory registry with `request_key` index and lazy TTL eviction, timing-model-v2 constants (no asyncio driving code) |
