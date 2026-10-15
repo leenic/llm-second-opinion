@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llm-second-opinion"
-version = "0.2.2"
-description = "Local MCP server that routes a user-supplied summary to an external LLM (Gemini, Grok, ChatGPT) for an independent second opinion."
+version = "0.3.0"
+description = "Local MCP server that routes a user-supplied summary to an external LLM (Gemini, Grok, ChatGPT, Claude) for an independent second opinion."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -16,6 +16,8 @@ dependencies = [
     "mcp>=1.2.0,<2",
     "openai>=2.36,<3",
     "google-genai>=2.0,<3",
+    # 1.11: `fallbacks` on beta.messages and `output_tokens_details`.
+    "anthropic>=1.11,<2",
 ]
 
 [project.optional-dependencies]

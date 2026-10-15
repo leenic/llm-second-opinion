@@ -4,7 +4,7 @@ This guide is for **the person sitting in front of Claude** (Claude Code or Clau
 
 ## What this gives you in your Claude session
 
-A new tool that Claude can call: **`second_opinion`**. When you trigger it, Claude pauses, ships a summary you (or it) wrote to an external LLM — ChatGPT, Gemini, or Grok — and brings back that model's reply. Use it when you want a perspective that isn't Claude's, on something Claude has been helping with.
+A new tool that Claude can call: **`second_opinion`**. When you trigger it, Claude pauses, ships a summary you (or it) wrote to an external LLM — ChatGPT, Gemini, Grok, or a different Claude model — and brings back that model's reply. Use it when you want a perspective that isn't Claude's, on something Claude has been helping with.
 
 Two extensions make it useful for heavyweight reviews:
 
@@ -60,7 +60,7 @@ Things to know:
 
 - **Probe, then fire.** After the Claude session has sat idle for a while, the connection to the server can go stale and the *first* tool call after the gap is sometimes lost — it never reaches the server and produces a four-minute client error. Cheap habit: ask *"which second-opinion models are available?"* first. That call is instant and re-warms the connection; then ask for the review. If a submit does seem to vanish, just ask Claude to submit again — it passes a `request_key`, so a retry that turns out to be a duplicate returns the same job instead of starting a second paid one.
 - **Privacy.** Stateless at the application layer: the server persists nothing. Synchronous calls ask each vendor not to store the request; background jobs require vendor-side storage under that vendor's retention policy. Web search may expose prompt material to search systems and visited sites. Use the synchronous tool with web search off for sensitive material. (Grok reviews run in-process even as background jobs — xAI has no background mode — so they are an ordinary synchronous call that asks xAI not to store the request.)
-- **Restarting the server loses running jobs.** The job list lives in the server's memory. If Claude Desktop or Claude Code restarts the MCP server, a Grok job is gone outright; ChatGPT and Gemini jobs finish upstream (and are billed) but the server can no longer find them, and asking about them returns `unknown_job`. Submit again.
+- **Restarting the server loses running jobs.** The job list lives in the server's memory. If Claude Desktop or Claude Code restarts the MCP server, a Grok or Claude job is gone outright; ChatGPT and Gemini jobs finish upstream (and are billed) but the server can no longer find them, and asking about them returns `unknown_job`. Submit again.
 - **At most eight jobs run at once.** A ninth submit is refused (`job_limit`) until one finishes or is cancelled.
 
 ## Reviewing a document: attach the file
@@ -87,9 +87,10 @@ There's no universal best. Rough heuristics:
 
 | Situation | Try first |
 |---|---|
-| Long codebase summaries, careful reasoning, multimodal | **Gemini** (`gemini-3.8-flash`) — strong long-context, and the fastest of the three (~17–19s on a typical review, measured on the previous `gemini-3.6-flash`). |
+| Long codebase summaries, careful reasoning, multimodal | **Gemini** (`gemini-4-argon`) — Google's flagship reasoning model, strong long-context (~14s on a short review at `high` with web search; the ~17–19s typical-review figure was measured on the earlier `gemini-3.6-flash`). |
 | Deep tool-use thinking, careful refactoring critique | **ChatGPT** (`gpt-6-astra`) — current OpenAI flagship, deepest tool-aware reasoning. Reasoning-only: it rejects `temperature`. |
 | Want a sharper, more contrarian take; also good price/performance | **Grok** (`grok-4.7`) — searches the web most aggressively of the three, and is correspondingly the slowest (~44–50s, measured on the previous `grok-4.5`). |
+| You're working in Claude Opus 5.5 and want a stronger Claude model to check the work | **Claude** (`claude-fable-5-1`), Anthropic's most capable model. It comes from the same vendor, so expect less disagreement than from the others. It is best at catching reasoning slips and gaps, not at offering a different perspective. If you work in Fable, set the Claude model to `claude-opus-5-5` instead. |
 | Need fresh facts (post-cutoff news, library docs, current pricing) | Whichever has `web_search: true` in your config — see below. |
 
 When in doubt, ask the same question of two of them and compare. Claude is happy to do that in one turn.
@@ -110,7 +111,7 @@ You don't need to remember the arg names — say what you want and Claude will m
 
 These are per-provider, set once, and apply to every call until you change them:
 
-- **`reasoning_effort`** — how hard the external model thinks before answering. Higher = slower and more expensive but usually better. Each provider has its own vocabulary (OpenAI: `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`; Grok: `low`/`medium`/`high`/`xhigh`; Gemini: `minimal`/`low`/`medium`/`high` — see the README for the source pages); a value the provider doesn't document is refused at startup. If you didn't set it, the model uses its own default.
+- **`reasoning_effort`** — how hard the external model thinks before answering. Higher = slower and more expensive but usually better. Each provider has its own vocabulary (OpenAI: `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`; Grok: `low`/`medium`/`high`/`xhigh`; Gemini: `minimal`/`low`/`medium`/`high`; Claude: `low`/`medium`/`high`/`xhigh`/`max` — see the README for the source pages); a value the provider doesn't document is refused at startup. If you didn't set it, the model uses its own default.
 - **`web_search`** (`true` | `false`) — whether the external model is allowed to hit the live web. Off by default. Turn it on for the model you want to use for fact-checking; leave it off otherwise to keep responses fast and bounded to model knowledge.
 
 To change either of these you edit `config.json` and restart the MCP server (Claude Code or Claude Desktop). You can also override at launch time with env vars like `LLM_SECOND_OPINION_OPENAI_REASONING_EFFORT=high` — see the README.
@@ -125,7 +126,7 @@ A successful call returns something like:
 {
   "success": true,
   "provider": "gemini",
-  "model": "gemini-3.8-flash",
+  "model": "gemini-4-argon",
   "response": "The plan has two problems...",
   "usage": { "input_tokens": 412, "output_tokens": 1031, "total_tokens": 1443 },
   "latency_ms": 4820,

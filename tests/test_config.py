@@ -40,7 +40,7 @@ def config_env(tmp_path, monkeypatch):
 
 class TestDefaultModels:
     def test_every_provider_has_a_default(self):
-        assert set(DEFAULT_MODELS) == {"openai", "gemini", "grok"}
+        assert set(DEFAULT_MODELS) == {"openai", "anthropic", "gemini", "grok"}
         assert all(v and isinstance(v, str) for v in DEFAULT_MODELS.values())
 
     def test_omitted_model_falls_back_to_default(self, config_env):

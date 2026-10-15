@@ -369,8 +369,9 @@
       </thead>
       <tbody>
         <tr><td class="pname">chatgpt</td><td>OpenAI — Responses API</td><td><code>gpt-6-astra</code></td><td><code>openai ≥ 2.36</code></td></tr>
-        <tr><td class="pname">gemini</td><td>Google — Interactions API</td><td><code>gemini-3.8-flash</code></td><td><code>google-genai ≥ 2.0</code></td></tr>
+        <tr><td class="pname">gemini</td><td>Google — Interactions API</td><td><code>gemini-4-argon</code></td><td><code>google-genai ≥ 2.0</code></td></tr>
         <tr><td class="pname">grok</td><td>xAI — OpenAI-compatible Responses API</td><td><code>grok-4.7</code></td><td><code>openai ≥ 2.36</code></td></tr>
+        <tr><td class="pname">claude</td><td>Anthropic — Messages API</td><td><code>claude-fable-5-1</code></td><td><code>anthropic ≥ 1.11</code></td></tr>
       </tbody>
     </table>
 
@@ -401,7 +402,7 @@
       <div class="card">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/><path d="M3 3l2 2M21 3l-2 2"/></svg></div>
         <h3>Background jobs for long reviews</h3>
-        <p>A whole document, web search on, high reasoning effort — <code style="font-family:var(--mono);color:var(--accent-2)">submit_second_opinion</code> returns a job id in seconds and the review runs upstream for up to 15 minutes (OpenAI and Google background execution; an in-process task for Grok). <code style="font-family:var(--mono);color:var(--accent-2)">get_second_opinion</code> polls it, results stay readable for 30 minutes, and only an explicit cancel stops it. Retries are safe: a <code style="font-family:var(--mono)">request_key</code> makes a repeated submit return the same job. For a whole document, attach it by path and let the server read it — no pasting.</p>
+        <p>A whole document, web search on, high reasoning effort — <code style="font-family:var(--mono);color:var(--accent-2)">submit_second_opinion</code> returns a job id in seconds and the review runs upstream for up to 15 minutes (OpenAI and Google background execution; an in-process task for Grok and Claude). <code style="font-family:var(--mono);color:var(--accent-2)">get_second_opinion</code> polls it, results stay readable for 30 minutes, and only an explicit cancel stops it. Retries are safe: a <code style="font-family:var(--mono)">request_key</code> makes a repeated submit return the same job. For a whole document, attach it by path and let the server read it — no pasting.</p>
       </div>
       <div class="card">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></div>

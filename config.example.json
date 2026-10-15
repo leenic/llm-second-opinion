@@ -8,7 +8,7 @@
     },
     "gemini": {
       "api_key": "AIza-REPLACE-ME",
-      "model": "gemini-3.8-flash",
+      "model": "gemini-4-argon",
       "reasoning_effort": "medium",
       "web_search": false
     },
@@ -16,6 +16,12 @@
       "api_key": "xai-REPLACE-ME",
       "model": "grok-4.7",
       "reasoning_effort": "medium",
+      "web_search": false
+    },
+    "anthropic": {
+      "api_key": "sk-ant-REPLACE-ME",
+      "model": "claude-fable-5-1",
+      "reasoning_effort": "high",
       "web_search": false
     }
   },

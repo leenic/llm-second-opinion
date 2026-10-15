@@ -2,11 +2,11 @@
 
 **📖 [Introduction &amp; live demo →](https://leenic.github.io/llm-second-opinion/)** — what it is, why it exists, and an animated walkthrough.
 
-A local MCP server that lets Claude ask an external LLM (Gemini, Grok, or ChatGPT) for an independent, critical second opinion. The review runs either as one synchronous tool call or as a background job that outlives any single call, and the material under review can be a summary Claude writes or a file on disk the server reads directly. Designed for single-developer use over stdio.
+A local MCP server that lets Claude ask an external LLM (Gemini, Grok, ChatGPT, or a *different* Claude model) for an independent, critical second opinion. The review runs either as one synchronous tool call or as a background job that outlives any single call, and the material under review can be a summary Claude writes or a file on disk the server reads directly. Designed for single-developer use over stdio.
 
 ## What it does
 
-- `second_opinion` — sends a `summary` to one of `gemini`, `grok`, or `chatgpt`, returns the external model's reply along with the actual model identifier, token usage (when reported), and upstream latency. Synchronous: the reply comes back in the same tool call, bounded at 200 s.
+- `second_opinion` — sends a `summary` to one of `gemini`, `grok`, `chatgpt`, or `claude`, returns the external model's reply along with the actual model identifier, token usage (when reported), and upstream latency. Synchronous: the reply comes back in the same tool call, bounded at 200 s.
 - `submit_second_opinion` / `get_second_opinion` / `cancel_second_opinion` — the same review run as a **background job**. `submit` returns a `job_id` within seconds; `get` polls it (optionally waiting up to 45 s); `cancel` stops it. Use these for heavyweight reviews — large documents, web search, high reasoning effort — that cannot finish inside the per-call time cap. See [Background jobs](#background-jobs-submitpoll).
 - **Attachments** (0.2.1) — both review tools take `attachment_paths`: files the server reads itself and splices into the prompt after `summary`, byte-exact, so a document review does not round-trip the document through Claude's context and output. Off until `attachment_roots` is configured; guarded by a root allowlist, a secrets denylist, text-only and size checks. See [Attachments](#attachments).
 - `list_available_models` — returns which providers have an API key configured and pass a basic reachability check, each provider's allowed `reasoning_effort` values, and whether attachments are enabled, so Claude can tell you up front what is usable.
@@ -18,12 +18,21 @@ Each call is single-turn. Only the summary, focus, system prompt and any explici
 | Provider | Interface | Default model | SDK |
 |---|---|---|---|
 | ChatGPT (OpenAI) | Responses API (`client.responses.create`) | `gpt-6-astra` | `openai>=2.36` |
-| Gemini (Google) | Interactions API (`client.aio.interactions.create`) | `gemini-3.8-flash` | `google-genai>=2.0` |
+| Gemini (Google) | Interactions API (`client.aio.interactions.create`) | `gemini-4-argon` | `google-genai>=2.0` |
 | Grok (xAI) | Responses API via OpenAI-compatible base URL (`https://api.x.ai/v1`) | `grok-4.7` | `openai>=2.36` |
+| Claude (Anthropic) | Messages API, streamed (`client.beta.messages.stream`) | `claude-fable-5-1` | `anthropic>=1.11` |
 
 These are the stateful/agentic-first interfaces each provider now recommends for new integrations. We call them in single-turn mode (no `previous_response_id`, no Interactions session state) because v1 of this server forwards no conversation history.
 
-**Note:** `gpt-6-astra` is reasoning-only and rejects `temperature` outright (`400 Unsupported parameter`) rather than ignoring it; `grok-4.7` and `gemini-3.8-flash` both accept it. You don't need to track which is which — if a model rejects an advisory sampling parameter, the Responses provider drops it and retries once, logging a warning. Sampling knobs only (`temperature`, `top_p`); `max_output_tokens` is never dropped, because silently removing a length cap would change cost and truncation. Override any default with `LLM_SECOND_OPINION_<PROVIDER>_MODEL`.
+**Note:** `gpt-6-astra` is reasoning-only and rejects `temperature` outright (`400 Unsupported parameter`) rather than ignoring it; `grok-4.7` accepts it; `gemini-4-argon` accepts the parameter but ignores it (Google: "If provided, they are ignored"). You don't need to track which is which — if a model rejects an advisory sampling parameter, the Responses provider drops it and retries once, logging a warning. Sampling knobs only (`temperature`, `top_p`); `max_output_tokens` is never dropped, because silently removing a length cap would change cost and truncation. Override any default with `LLM_SECOND_OPINION_<PROVIDER>_MODEL`.
+
+**Claude as a reviewer.** The `claude` target exists so a Claude session can get a second opinion from a *different* Claude model. If you are working in Claude Opus 5.5, the default `claude-fable-5-1` gives you Anthropic's most capable model as the reviewer. Pointing it at the same model you are already using gets you a fresh context, not an independent view. Specifics:
+
+- Sampling parameters were removed from Claude Opus 4.7 and later (Fable, Opus 5.x, Sonnet 5.x), so the adapter drops `temperature` for those models without trying it first. Older models (Sonnet 4.6, Opus 4.6, Haiku 4.5) still receive it.
+- `thinking` is never sent: current models think adaptively by default, and Fable 5.1 / Opus 5.5 reject any other setting. `reasoning_effort` maps to `output_config.effort`.
+- On Fable 5.1, Opus 5.x and Sonnet 5.5 the adapter opts into **server-side refusal fallback** (`fallbacks: "default"`). If a safety classifier declines the request, Anthropic re-runs it on a recommended substitute model instead of returning a refusal. The result's `model` field then names the model that actually answered. If that model declines too, you get `content_blocked`.
+- Claude Fable 5.1 requires 30-day data retention. An organisation on zero data retention gets `bad_request` and should set `model` to `claude-opus-5-5` (or another model its retention terms allow).
+- `max_tokens` is mandatory on this API, so a `null` `default_max_tokens` becomes 64000 for Claude.
 
 ## Install
 
@@ -61,6 +70,7 @@ A provider with no key (or with the `REPLACE-ME` placeholder) is treated as unav
 | `providers.openai.api_key` | OpenAI API key (for `target_model: chatgpt`) |
 | `providers.gemini.api_key` | Google AI Studio key (for `target_model: gemini`) |
 | `providers.grok.api_key` | xAI API key (for `target_model: grok`) |
+| `providers.anthropic.api_key` | Anthropic API key (for `target_model: claude`) |
 | `providers.<name>.model` | Optional model name override for that provider |
 | `providers.<name>.reasoning_effort` | Optional. Must be one of that provider's documented values — see [How `reasoning_effort` is applied per provider](#how-reasoning_effort-is-applied-per-provider). Omit to use the provider's default thinking depth |
 | `providers.<name>.web_search` | Optional `true`/`false`. Attaches the provider's built-in web search tool to every call. Default `false` |
@@ -92,7 +102,7 @@ The same value is used for the provider's HTTP client timeout, so the socket is 
 
 `default_max_tokens` is not a "shorten the answer" knob. A reply that hits the cap comes back `incomplete` and surfaces as an error — **you get nothing, not a shorter answer** — so setting it too tight is worse than setting it too loose.
 
-The real ceiling is `request_budget_seconds`, not the provider API. Measured against the live providers on a long-form prompt (on the previous defaults; `gemini-3.8-flash` keeps the same 65,536 output cap):
+The real ceiling is `request_budget_seconds`, not the provider API. Measured against the live providers on a long-form prompt (on the previous defaults; `gemini-4-argon` keeps the same 65,536 synchronous output cap):
 
 | Model | Hard output cap | Sustained rate | Reachable in 200s |
 |---|---|---|---|
@@ -132,14 +142,15 @@ Every tool call stays short, so a call the client drops costs only the price of 
 | ChatGPT | OpenAI Responses background mode (`background: true`, `store: true`), polled by response id | Upstream yes — but the job is unreachable afterwards, see below |
 | Gemini | Interactions API background execution (`background: true`), polled by interaction id | Same |
 | Grok | In-process task running the ordinary synchronous call. xAI rejects `background` (`400 Argument not supported`), and a stored response whose connection is dropped mid-generation is never retrievable — measured, see the design doc §12.1 | No — the job dies with the process |
+| Claude | In-process task running the ordinary synchronous call. The Messages API has no submit/poll mode (Message Batches is a 24-hour queue, not a fit) | No — the job dies with the process |
 
-**Restart semantics.** The job registry is process memory only. If the server restarts, `get_second_opinion` returns `unknown_job` for every earlier job: grok jobs died with the process; ChatGPT and Gemini jobs finish upstream, are billed, and are in principle retrievable from the vendor — but the `job_id` → response-id mapping is gone, so this server cannot reach them. Durable mapping is a deliberate non-goal for 0.2.
+**Restart semantics.** The job registry is process memory only. If the server restarts, `get_second_opinion` returns `unknown_job` for every earlier job: Grok and Claude jobs died with the process; ChatGPT and Gemini jobs finish upstream, are billed, and are in principle retrievable from the vendor — but the `job_id` → response-id mapping is gone, so this server cannot reach them. Durable mapping is a deliberate non-goal for 0.2.
 
 #### Privacy
 
-Stateless at the application layer: the server persists nothing. Synchronous calls ask each vendor not to store the request; background jobs require vendor-side storage under that vendor's retention policy. Web search may expose prompt material to search systems and visited sites. Use the synchronous tool with web search off for sensitive material. In detail: the synchronous tool sends `store: false` to OpenAI and xAI (Responses API) and to Google (Interactions API); background jobs send `store: true` to OpenAI (unstored background responses are kept only about ten minutes) and nothing about storage to Google, whose interactions are stored by default (55 days on the paid tier, 1 day on the free tier) and which rejects `store: false` with background execution. Grok-backed jobs are an ordinary synchronous API call with `store: false`. Attachments are read only from directories you allowlist and their content never enters the log (see [Attachments](#attachments)).
+Stateless at the application layer: the server persists nothing. Synchronous calls ask each vendor not to store the request; background jobs require vendor-side storage under that vendor's retention policy. Web search may expose prompt material to search systems and visited sites. Use the synchronous tool with web search off for sensitive material. In detail: the synchronous tool sends `store: false` to OpenAI and xAI (Responses API) and to Google (Interactions API); background jobs send `store: true` to OpenAI (unstored background responses are kept only about ten minutes) and nothing about storage to Google, whose interactions are stored by default (55 days on the paid tier, 1 day on the free tier) and which rejects `store: false` with background execution. Grok-backed jobs are an ordinary synchronous API call with `store: false`. Anthropic's Messages API keeps no retrievable response object, so it has no `store` flag to send; requests fall under your Anthropic organisation's retention policy. Attachments are read only from directories you allowlist and their content never enters the log (see [Attachments](#attachments)).
 
-**Cancellation is explicit.** Abandoning, timing out, or never issuing a `get` call never cancels a job. Only `cancel_second_opinion`, job-budget exhaustion, or (for grok) process shutdown stops upstream work.
+**Cancellation is explicit.** Abandoning, timing out, or never issuing a `get` call never cancels a job. Only `cancel_second_opinion`, job-budget exhaustion, or (for Grok and Claude) process shutdown stops upstream work.
 
 **Capacity and retention.** At most 8 jobs may be running at once (`job_limit` otherwise, listing the active ids). Finished jobs — succeeded, failed or cancelled — stay readable for 30 minutes, then are evicted; every `get` of a finished job returns the same envelope.
 
@@ -162,9 +173,10 @@ Each provider has its own vocabulary, taken from that vendor's documentation (ch
 |---|---|---|
 | OpenAI | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (model-dependent — a value the configured model does not support is rejected upstream as `bad_request`) | `reasoning={"effort": "<value>"}` on the Responses API call |
 | Grok | `low`, `medium`, `high`, `xhigh` (`xhigh` is treated as `high` on grok-4.5) | `reasoning={"effort": "<value>"}` on the Responses API call |
-| Gemini | `minimal`, `low`, `medium`, `high` (the 3.x Flash line accepts all four; Pro lines accept a subset and reject the rest upstream) | `generation_config.thinking_level = "<value>"` on the Interactions API call |
+| Gemini | `minimal`, `low`, `medium`, `high` (the 3.x Flash line accepts all four; `gemini-4-argon` and the Pro lines accept `low`/`medium`/`high` and reject `minimal` upstream) | `generation_config.thinking_level = "<value>"` on the Interactions API call |
+| Claude | `low`, `medium`, `high`, `xhigh`, `max` (Haiku 4.5 rejects the parameter upstream) | `output_config={"effort": "<value>"}` on the Messages API call |
 
-If omitted, the SDK's own default applies — for all three current flagships that means reasoning is **on** at a provider-chosen depth.
+If omitted, the SDK's own default applies. For all four current flagships that means reasoning is **on** at a provider-chosen depth (Claude: `high`, except Opus 5.5 which defaults to `medium`).
 
 #### How `web_search` is applied per provider
 
@@ -173,6 +185,7 @@ If omitted, the SDK's own default applies — for all three current flagships th
 | OpenAI | `tools=[{"type": "web_search"}]` |
 | Gemini | `tools=[{"type": "google_search"}]` on the Interactions API call |
 | Grok | `tools=[{"type": "web_search"}]` via the OpenAI-compatible Responses layer. If xAI rejects this shape on your account, set `web_search: false` for `grok` and use Gemini or OpenAI for queries that need fresh facts |
+| Claude | `tools=[{"type": "web_search_20260209", "name": "web_search"}]` (server-side, with dynamic filtering). A `pause_turn` stop from a long search is resumed automatically, up to 5 times inside the same budget |
 
 Enabling web search adds latency and may add cost depending on the provider's billing.
 
@@ -186,9 +199,11 @@ All env vars are prefixed `LLM_SECOND_OPINION_`. They take precedence over the c
 | `LLM_SECOND_OPINION_OPENAI_API_KEY` | Override OpenAI key from the config file |
 | `LLM_SECOND_OPINION_GEMINI_API_KEY` | Override Gemini key from the config file |
 | `LLM_SECOND_OPINION_GROK_API_KEY` | Override Grok key from the config file |
+| `LLM_SECOND_OPINION_ANTHROPIC_API_KEY` | Override Anthropic key from the config file |
 | `LLM_SECOND_OPINION_OPENAI_MODEL` | Override the default OpenAI model |
 | `LLM_SECOND_OPINION_GEMINI_MODEL` | Override the default Gemini model |
 | `LLM_SECOND_OPINION_GROK_MODEL` | Override the default Grok model |
+| `LLM_SECOND_OPINION_ANTHROPIC_MODEL` | Override the default Claude model (e.g. `claude-opus-5-5` if you work in Fable and want Opus to review) |
 | `LLM_SECOND_OPINION_<PROVIDER>_REASONING_EFFORT` | Override `reasoning_effort` for that provider |
 | `LLM_SECOND_OPINION_<PROVIDER>_WEB_SEARCH` | `true`/`false` — override `web_search` for that provider |
 | `LLM_SECOND_OPINION_REQUEST_BUDGET` | Override `request_budget_seconds` (the legacy `LLM_SECOND_OPINION_TIMEOUT` still works) |
@@ -247,7 +262,7 @@ For a user-facing walkthrough of how to drive the tool from a Claude conversatio
 | Arg | Type | Required | Notes |
 |---|---|---|---|
 | `summary` | string | yes | The content to review |
-| `target_model` | enum `gemini` \| `grok` \| `chatgpt` | yes | Which external LLM to call |
+| `target_model` | enum `gemini` \| `grok` \| `chatgpt` \| `claude` | yes | Which external LLM to call |
 | `focus` | string | no | Aspect to emphasise in the review |
 | `system_prompt` | string | no | Overrides the default reviewer prompt |
 | `temperature` | number | no | Sampling temperature, passed through |
@@ -262,7 +277,7 @@ Successful response:
   "request_id": "ab12cd34ef56",
   "target_model": "gemini",
   "provider": "gemini",
-  "model": "gemini-3.8-flash",
+  "model": "gemini-4-argon",
   "response": "...",
   "usage": { "input_tokens": 123, "output_tokens": 456, "total_tokens": 579 },
   "latency_ms": 1840,
@@ -338,7 +353,7 @@ Returns as soon as the upstream acknowledges the job (bounded at 30 s):
 }
 ```
 
-`backing` is `provider_background` (ChatGPT, Gemini) or `local_task` (Grok). A deduplicated submit adds `"reused_existing_job": true`. Errors use the same envelope as `second_opinion`; `job_limit` (retriable) means 8 jobs are already running and lists them.
+`backing` is `provider_background` (ChatGPT, Gemini) or `local_task` (Grok, Claude). A deduplicated submit adds `"reused_existing_job": true`. Errors use the same envelope as `second_opinion`; `job_limit` (retriable) means 8 jobs are already running and lists them.
 
 ### `get_second_opinion`
 

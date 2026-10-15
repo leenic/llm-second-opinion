@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..config import AppConfig
+from .anthropic_provider import AnthropicProvider
 from .base import Provider, ProviderError, SecondOpinionRequest, SecondOpinionResponse, TokenUsage
 from .gemini import GeminiProvider
 from .grok import GrokProvider
@@ -11,11 +12,20 @@ from .openai_provider import OpenAIProvider
 # target_model values the tool accepts, mapped to provider keys in config.
 TARGET_TO_PROVIDER: dict[str, str] = {
     "chatgpt": "openai",
+    "claude": "anthropic",
     "gemini": "gemini",
     "grok": "grok",
 }
 
 PROVIDER_TO_TARGET: dict[str, str] = {v: k for k, v in TARGET_TO_PROVIDER.items()}
+
+# Adapter class per provider key in config.
+PROVIDER_CLASSES: dict[str, type[Provider]] = {
+    "openai": OpenAIProvider,
+    "anthropic": AnthropicProvider,
+    "gemini": GeminiProvider,
+    "grok": GrokProvider,
+}
 
 
 def build_provider(
@@ -54,12 +64,9 @@ def build_provider(
         "reasoning_effort": pcfg.reasoning_effort,
         "web_search": pcfg.web_search,
     }
-    if provider_key == "openai":
-        return OpenAIProvider(**kwargs)
-    if provider_key == "grok":
-        return GrokProvider(**kwargs)
-    if provider_key == "gemini":
-        return GeminiProvider(**kwargs)
+    cls = PROVIDER_CLASSES.get(provider_key)
+    if cls is not None:
+        return cls(**kwargs)
     raise ProviderError("internal_error", f"No adapter for {provider_key}", retriable=False)
 
 
@@ -70,9 +77,11 @@ __all__ = [
     "SecondOpinionResponse",
     "TokenUsage",
     "OpenAIProvider",
+    "AnthropicProvider",
     "GrokProvider",
     "GeminiProvider",
     "TARGET_TO_PROVIDER",
     "PROVIDER_TO_TARGET",
+    "PROVIDER_CLASSES",
     "build_provider",
 ]
