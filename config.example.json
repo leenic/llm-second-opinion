@@ -8,7 +8,7 @@
     },
     "gemini": {
       "api_key": "AIza-REPLACE-ME",
-      "model": "gemini-3.8-flash",
+      "model": "gemini-4-argon",
       "reasoning_effort": "medium",
       "web_search": false
     },

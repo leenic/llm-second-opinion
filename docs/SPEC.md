@@ -138,7 +138,7 @@ Per provider (`openai`, `anthropic`, `gemini`, `grok` — the keys of `DEFAULT_M
 | Field | Resolution (highest precedence first) | Validation / semantics |
 |---|---|---|
 | `api_key` | env `LLM_SECOND_OPINION_<NAME>_API_KEY` → file `providers.<name>.api_key` | Blank or containing `REPLACE-ME` ⇒ `None` ⇒ provider **unavailable** (server still runs) |
-| `model` | env `…_<NAME>_MODEL` → file `model` → `DEFAULT_MODELS[name]` | Defaults: `openai: gpt-6-astra`, `anthropic: claude-fable-5-1`, `gemini: gemini-3.8-flash`, `grok: grok-4.7` (each vendor's current flagship; for Anthropic the most capable model, deliberately not the Opus a Claude caller is most likely running — the env override exists so a new flagship needs no code change) |
+| `model` | env `…_<NAME>_MODEL` → file `model` → `DEFAULT_MODELS[name]` | Defaults: `openai: gpt-6-astra`, `anthropic: claude-fable-5-1`, `gemini: gemini-4-argon`, `grok: grok-4.7` (each vendor's current flagship; for Anthropic the most capable model, deliberately not the Opus a Claude caller is most likely running — the env override exists so a new flagship needs no code change) |
 | `reasoning_effort` | env `…_<NAME>_REASONING_EFFORT` → file value | Normalised (strip + lowercase); must be in **that provider's** `REASONING_EFFORTS_BY_PROVIDER[name]` set else `ConfigError` naming the provider and its allowed values (0.2.1 — the sets differ by vendor and are sourced from primary docs, cited in `config.py`); unset/empty ⇒ `None` ⇒ SDK default thinking depth (reasoning **on** for all four current flagships) |
 | `web_search` | env `…_<NAME>_WEB_SEARCH` (truthy: `1/true/yes/on`) → file boolean → `False` | Non-boolean file value is ignored (treated as `False`) |
 
@@ -227,7 +227,7 @@ Send a summary to one external LLM and return its independent, critical reply.
   "request_id": "ab12cd34ef56",
   "target_model": "gemini",
   "provider": "gemini",
-  "model": "gemini-3.8-flash",
+  "model": "gemini-4-argon",
   "response": "…the external model's final answer…",
   "usage": {"input_tokens": 123, "output_tokens": 456, "total_tokens": 579, "reasoning_tokens": 40},
   "latency_ms": 1840,
@@ -614,7 +614,7 @@ model-output text, a non-text block after collecting is a barrier).
 
 **Model id:** `response.model` may be a string or an object; `id`/`name` attributes are tried before `str()`.
 
-No droppable-param retry exists on this path (`gemini-3.6-flash` and `gemini-3.8-flash` accept `temperature`).
+No droppable-param retry exists on this path (`gemini-3.6-flash` and `gemini-3.8-flash` accept `temperature`; `gemini-4-argon` accepts and ignores it).
 
 **Structure (0.2.0):** `generate` = `_build_kwargs` → `_call(make_coro, timeout)` (the `wait_for` bound and
 the error mapping above; the coroutine is created inside the guard) → `_build_response` (the status mapping,
@@ -751,7 +751,7 @@ but never to the job — background work decoupled from any listener is the poin
 error (§9.1) — the user gets *nothing*, not a shorter answer — so a tight cap is strictly worse than a loose
 one (an earlier default of 8000 was cutting real reviews short; commit history records the raise).
 
-The real ceiling is the time budget, not the provider API. Measured live (long-form prompt) on the previous defaults; `gemini-3.8-flash` keeps the same 65,536 output cap:
+The real ceiling is the time budget, not the provider API. Measured live (long-form prompt) on the previous defaults; `gemini-4-argon` keeps the same 65,536 synchronous output cap:
 
 | Model | Hard output cap | Sustained rate | Reachable in 200 s |
 |---|---|---|---|

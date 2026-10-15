@@ -18,13 +18,13 @@ Each call is single-turn. Only the summary, focus, system prompt and any explici
 | Provider | Interface | Default model | SDK |
 |---|---|---|---|
 | ChatGPT (OpenAI) | Responses API (`client.responses.create`) | `gpt-6-astra` | `openai>=2.36` |
-| Gemini (Google) | Interactions API (`client.aio.interactions.create`) | `gemini-3.8-flash` | `google-genai>=2.0` |
+| Gemini (Google) | Interactions API (`client.aio.interactions.create`) | `gemini-4-argon` | `google-genai>=2.0` |
 | Grok (xAI) | Responses API via OpenAI-compatible base URL (`https://api.x.ai/v1`) | `grok-4.7` | `openai>=2.36` |
 | Claude (Anthropic) | Messages API, streamed (`client.beta.messages.stream`) | `claude-fable-5-1` | `anthropic>=1.11` |
 
 These are the stateful/agentic-first interfaces each provider now recommends for new integrations. We call them in single-turn mode (no `previous_response_id`, no Interactions session state) because v1 of this server forwards no conversation history.
 
-**Note:** `gpt-6-astra` is reasoning-only and rejects `temperature` outright (`400 Unsupported parameter`) rather than ignoring it; `grok-4.7` and `gemini-3.8-flash` both accept it. You don't need to track which is which — if a model rejects an advisory sampling parameter, the Responses provider drops it and retries once, logging a warning. Sampling knobs only (`temperature`, `top_p`); `max_output_tokens` is never dropped, because silently removing a length cap would change cost and truncation. Override any default with `LLM_SECOND_OPINION_<PROVIDER>_MODEL`.
+**Note:** `gpt-6-astra` is reasoning-only and rejects `temperature` outright (`400 Unsupported parameter`) rather than ignoring it; `grok-4.7` accepts it; `gemini-4-argon` accepts the parameter but ignores it (Google: "If provided, they are ignored"). You don't need to track which is which — if a model rejects an advisory sampling parameter, the Responses provider drops it and retries once, logging a warning. Sampling knobs only (`temperature`, `top_p`); `max_output_tokens` is never dropped, because silently removing a length cap would change cost and truncation. Override any default with `LLM_SECOND_OPINION_<PROVIDER>_MODEL`.
 
 **Claude as a reviewer.** The `claude` target exists so a Claude session can get a second opinion from a *different* Claude model. If you are working in Claude Opus 5.5, the default `claude-fable-5-1` gives you Anthropic's most capable model as the reviewer. Pointing it at the same model you are already using gets you a fresh context, not an independent view. Specifics:
 
@@ -102,7 +102,7 @@ The same value is used for the provider's HTTP client timeout, so the socket is 
 
 `default_max_tokens` is not a "shorten the answer" knob. A reply that hits the cap comes back `incomplete` and surfaces as an error — **you get nothing, not a shorter answer** — so setting it too tight is worse than setting it too loose.
 
-The real ceiling is `request_budget_seconds`, not the provider API. Measured against the live providers on a long-form prompt (on the previous defaults; `gemini-3.8-flash` keeps the same 65,536 output cap):
+The real ceiling is `request_budget_seconds`, not the provider API. Measured against the live providers on a long-form prompt (on the previous defaults; `gemini-4-argon` keeps the same 65,536 synchronous output cap):
 
 | Model | Hard output cap | Sustained rate | Reachable in 200s |
 |---|---|---|---|
@@ -173,7 +173,7 @@ Each provider has its own vocabulary, taken from that vendor's documentation (ch
 |---|---|---|
 | OpenAI | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (model-dependent — a value the configured model does not support is rejected upstream as `bad_request`) | `reasoning={"effort": "<value>"}` on the Responses API call |
 | Grok | `low`, `medium`, `high`, `xhigh` (`xhigh` is treated as `high` on grok-4.5) | `reasoning={"effort": "<value>"}` on the Responses API call |
-| Gemini | `minimal`, `low`, `medium`, `high` (the 3.x Flash line accepts all four; Pro lines accept a subset and reject the rest upstream) | `generation_config.thinking_level = "<value>"` on the Interactions API call |
+| Gemini | `minimal`, `low`, `medium`, `high` (the 3.x Flash line accepts all four; `gemini-4-argon` and the Pro lines accept `low`/`medium`/`high` and reject `minimal` upstream) | `generation_config.thinking_level = "<value>"` on the Interactions API call |
 | Claude | `low`, `medium`, `high`, `xhigh`, `max` (Haiku 4.5 rejects the parameter upstream) | `output_config={"effort": "<value>"}` on the Messages API call |
 
 If omitted, the SDK's own default applies. For all four current flagships that means reasoning is **on** at a provider-chosen depth (Claude: `high`, except Opus 5.5 which defaults to `medium`).
@@ -277,7 +277,7 @@ Successful response:
   "request_id": "ab12cd34ef56",
   "target_model": "gemini",
   "provider": "gemini",
-  "model": "gemini-3.8-flash",
+  "model": "gemini-4-argon",
   "response": "...",
   "usage": { "input_tokens": 123, "output_tokens": 456, "total_tokens": 579 },
   "latency_ms": 1840,

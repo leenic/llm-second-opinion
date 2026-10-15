@@ -19,7 +19,7 @@ DEFAULT_MODELS = {
     # Fable rather than Opus: the expected caller is a Claude session that is
     # itself usually Opus, and a second opinion from the same model is not one.
     "anthropic": "claude-fable-5-1",
-    "gemini": "gemini-3.8-flash",
+    "gemini": "gemini-4-argon",
     "grok": "grok-4.7",
 }
 
@@ -48,7 +48,7 @@ BUDGET_WARN_THRESHOLD_SECONDS = 235.0
 # 8000 was cutting real reviews short.
 #
 # The real ceiling is the request budget, not the API. Measured against the
-# live providers: gemini-3.6-flash caps output at 65536 (3.8 too) and sustains ~178
+# live providers: gemini-3.6-flash caps output at 65536 (3.8 and 4-argon too) and sustains ~178
 # tok/s (~35k inside a 200s budget); OpenAI and xAI publish no hard cap at all
 # (both accepted max_output_tokens=10_000_000) but generate at ~62 and ~49
 # tok/s, so the budget binds first at roughly 12k and 10k. At 60000 both of
@@ -92,9 +92,10 @@ REASONING_EFFORTS_BY_PROVIDER: dict[str, frozenset[str]] = {
     # none, minimal, low, medium, high, xhigh, and max."
     "openai": frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"}),
     # https://ai.google.dev/gemini-api/docs/thinking (checked 2026-09-11):
-    # `thinking_level` per model — the 3.x Flash line (incl. the default
-    # gemini-3.6-flash) takes minimal/low/medium/high; Pro lines take
-    # low/medium/high or low/high. The provider set is the union.
+    # `thinking_level` per model — the 3.x Flash line takes
+    # minimal/low/medium/high; Pro lines take low/medium/high or low/high,
+    # and the default gemini-4-argon takes low/medium/high (rechecked
+    # 2026-10-15: `minimal` is a 400 on it). The provider set is the union.
     "gemini": frozenset({"minimal", "low", "medium", "high"}),
     # https://docs.x.ai/docs/guides/reasoning (checked 2026-09-11):
     # `reasoning_effort` accepts low, medium, high, xhigh; xhigh is available

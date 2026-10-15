@@ -87,7 +87,7 @@ There's no universal best. Rough heuristics:
 
 | Situation | Try first |
 |---|---|
-| Long codebase summaries, careful reasoning, multimodal | **Gemini** (`gemini-3.8-flash`) — strong long-context, and the fastest of the three (~17–19s on a typical review, measured on the previous `gemini-3.6-flash`). |
+| Long codebase summaries, careful reasoning, multimodal | **Gemini** (`gemini-4-argon`) — Google's flagship reasoning model, strong long-context (~14s on a short review at `high` with web search; the ~17–19s typical-review figure was measured on the earlier `gemini-3.6-flash`). |
 | Deep tool-use thinking, careful refactoring critique | **ChatGPT** (`gpt-6-astra`) — current OpenAI flagship, deepest tool-aware reasoning. Reasoning-only: it rejects `temperature`. |
 | Want a sharper, more contrarian take; also good price/performance | **Grok** (`grok-4.7`) — searches the web most aggressively of the three, and is correspondingly the slowest (~44–50s, measured on the previous `grok-4.5`). |
 | You're working in Claude Opus 5.5 and want a stronger Claude model to check the work | **Claude** (`claude-fable-5-1`), Anthropic's most capable model. It comes from the same vendor, so expect less disagreement than from the others. It is best at catching reasoning slips and gaps, not at offering a different perspective. If you work in Fable, set the Claude model to `claude-opus-5-5` instead. |
@@ -126,7 +126,7 @@ A successful call returns something like:
 {
   "success": true,
   "provider": "gemini",
-  "model": "gemini-3.8-flash",
+  "model": "gemini-4-argon",
   "response": "The plan has two problems...",
   "usage": { "input_tokens": 412, "output_tokens": 1031, "total_tokens": 1443 },
   "latency_ms": 4820,
